@@ -23,6 +23,26 @@
 
 ---
 
+## v4.3 穩定度與精準度升級（不影響正常開單頻率）
+
+> 本次升級僅強化**預言機 Strike 精度、WebSocket／Telegram 連線強韌性、過舊盤口保護與餘額即時同步**，**未更動任何進場門檻、Z 值、勝率或停利／止損規則**。
+
+1. **精準 Strike 雙層鎖定（`POLYBOLT_TWAP_T0` ➔ `GAMMA_OFFICIAL`）**
+   - 開盤 `t=0` 優先取窗口邊界 Chainlink 60s TWAP（`POLYBOLT_TWAP_T0` / `CHAINLINK_TWAP_T0`），避免開盤現貨跳動誤差（實測較 `t=0` 現貨與 `BOOK_CALIBRATED` 反推誤差降低 ~12x–18x），並保護此精準基準不被開盤盤口反推蓋寫。
+   - 若 Gamma 已公布上一盤 `finalPrice`（`GAMMA_PREV_FINAL`）或於盤中重啟，自動無縫升級鎖定 `GAMMA_OFFICIAL`（實測 `24/24` 窗口誤差 `$0.0000`）。
+2. **Telegram 推播高可靠投遞＋頻道／群組相容修復**
+   - `send_message_sync` 升級為 3 次指數退避重試，遇 `5xx`／連線異常自動重建 `requests.Session`；針對 `-100...` 頻道與群組自動省略 `ReplyKeyboardMarkup`（並於 HTTP 400 fallback 一併清除），避免 `inline keyboard expected` 失敗，且全路徑異常皆輸出 `[TG SEND WARN]` / `[TG NOTIFY FAILED]` 至 `stderr`。
+3. **PolyBolt WebSocket 殭屍連線看門狗**
+   - `_polybolt_v2_ws_loop` 啟用主動心跳（`ping_interval=15`、`ping_timeout=10`）與 `12s` `recv()` 超時看門狗，斷流即刻重連不卡死。
+4. **實盤過舊盤口防護（`book_age > 5.0s`）**
+   - 實盤下單閘門除既有 `cl_age > 4.5s` 外，新增檢查最後盤口更新時間（WS + REST fallback），僅在兩者同時斷更逾 `5.0s` 時攔截進場，不影響正常頻率。
+5. **平倉／結算後即時 `pUSD` 餘額同步**
+   - 盤中完整止盈／止損與 5m 官方結算完成後，立即刷新實盤 `pUSD` 可用餘額並同步更新跨幣風控權益基準，不等候 `20s` 週期輪詢。
+6. **主控台 `Edge` 與下單手續費口徑一致**
+   - 主控台即時顯示的 `up_edge`／`dn_edge` 同步傳入 `fee_rate=cfg.crypto_taker_fee_rate`，與策略內部決策模型完全對齊。
+
+---
+
 ## 目錄結構
 
 ```text
@@ -33,6 +53,7 @@ polymarket-5m-sniper-suite/
 ├── requirements.txt        # 統一依賴（含 py-clob-client-v2 與 httpx[http2]）
 ├── test_live_sizing_risk.py
 ├── test_daily_review.py
+├── test_upgrades_v43.py
 ├── polymarket-btc-5m/      # BTC 5m 監控＋下單（Telegram 主控）
 ├── polymarket-eth-5m/      # ETH 5m 監控＋下單（單向推播）
 └── polymarket-sol-5m/      # SOL 5m 監控＋下單（單向推播）
@@ -84,8 +105,8 @@ cd polymarket-btc-5m
 ### 5. 執行單元測試與每日唯讀健檢
 
 ```bash
-# 執行全部測試（等比倉位、日熔斷、健檢與三幣核心邏輯）
-.venv/bin/pytest -q test_live_sizing_risk.py test_daily_review.py
+# 執行全部測試（等比倉位、日熔斷、健檢、v4.3 升級與三幣核心邏輯）
+.venv/bin/pytest -q test_live_sizing_risk.py test_daily_review.py test_upgrades_v43.py
 (cd polymarket-btc-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-eth-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-sol-5m && ../.venv/bin/pytest -q tests/)

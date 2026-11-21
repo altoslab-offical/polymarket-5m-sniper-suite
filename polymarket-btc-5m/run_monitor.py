@@ -74,6 +74,15 @@ async def resolve_official_polymarket_outcome(
     for delay in (8.0, 15.0, 22.0):
         await asyncio.sleep(delay)
         meta = await loop.run_in_executor(None, fetch_5m_market_metadata, prev_window_ts, hub._http)
+        if meta and meta.get("official_final_price"):
+            cur_st = hub.state
+            if cur_st.current_window_ts == prev_window_ts + 300 and cur_st.strike_source != "GAMMA_OFFICIAL":
+                cur_st.strike_price = float(meta["official_final_price"])
+                cur_st.strike_source = "GAMMA_OFFICIAL"
+                print(
+                    f"\n🎯 [官方精準鎖定 Strike] {cur_st.current_window_ts} = "
+                    f"${cur_st.strike_price:,.4f} (GAMMA_PREV_FINAL)"
+                )
         if meta and meta.get("resolved_winner"):
             official_winner = meta["resolved_winner"]
             if meta.get("official_strike"):
@@ -157,6 +166,15 @@ async def resolve_official_polymarket_outcome(
                         "實盤風控熔斷觸發",
                         f"今日實盤累計虧損已達上限 (-${live_exec.max_daily_loss_usdc:.1f} pUSD)，已自動停止開新倉！",
                     )
+        if live_exec is not None:
+            try:
+                fresh_bal = await loop.run_in_executor(None, live_exec.get_pusd_balance)
+                if fresh_bal > 0.0:
+                    strategy.bankroll = fresh_bal
+                    if shared_risk is not None:
+                        shared_risk.sync_day_equity(fresh_bal)
+            except Exception:
+                pass
         stats = strategy.summary_stats()
         tag = "累積實盤戰績" if live_exec is not None else "累積模擬戰績"
         unit = "pUSD" if live_exec is not None else "USDC"
@@ -517,7 +535,17 @@ async def monitor_loop(
                         if live_exec is not None:
                             abort_live_entry = False
                             cl_age = time.time() - cl.local_recv_ts
+                            book_age = (
+                                (time.time() - st.last_book_update_local_ts)
+                                if st.last_book_update_local_ts > 0.0
+                                else 999.0
+                            )
                             if cl.source not in ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK", "POLY_RTDS_CHAINLINK") or cl_age > 4.5:
+                                abort_live_entry = True
+                            elif book_age > 5.0:
+                                print(
+                                    f"\n⚠️ [LIVE 盤口過舊攔截] book_age={book_age:.1f}s > 5.0s，跳過進場。"
+                                )
                                 abort_live_entry = True
                             elif (now - last_live_attempt_ts) < 5.0:
                                 abort_live_entry = True
@@ -705,6 +733,7 @@ async def monitor_loop(
                                 live_exec.daily_pnl_usdc = float(r_state["daily_realized_pnl_usdc"])
                                 live_exec.max_daily_loss_usdc = float(r_state["max_daily_loss_usdc"])
                                 live_exec.circuit_broken = bool(r_state["circuit_broken"])
+                            last_bal_sync_ts = 0.0
                             if live_exec.circuit_broken:
                                 print(
                                     f"\n🛑 [風控熔斷] 今日實盤累計虧損已達上限 "
@@ -742,12 +771,22 @@ async def monitor_loop(
                 up_ask_str = f"{st.book.up_ask:.2f}" if st.book.up_ask else " -- "
                 dn_ask_str = f"{st.book.down_ask:.2f}" if st.book.down_ask else " -- "
                 up_edge = (
-                    (fv.p_true_up - st.book.up_ask - taker_fee_per_share(st.book.up_ask)) * 100
+                    (
+                        fv.p_true_up
+                        - st.book.up_ask
+                        - taker_fee_per_share(st.book.up_ask, fee_rate=cfg.crypto_taker_fee_rate)
+                    )
+                    * 100
                     if (st.book.up_ask and st.book.up_ask >= 0.05)
                     else -99.0
                 )
                 dn_edge = (
-                    (fv.p_true_down - st.book.down_ask - taker_fee_per_share(st.book.down_ask)) * 100
+                    (
+                        fv.p_true_down
+                        - st.book.down_ask
+                        - taker_fee_per_share(st.book.down_ask, fee_rate=cfg.crypto_taker_fee_rate)
+                    )
+                    * 100
                     if (st.book.down_ask and st.book.down_ask >= 0.05)
                     else -99.0
                 )

@@ -169,6 +169,7 @@ class ChainlinkOracleFeed:
         self.state = ChainlinkOracleState()
         self._twap_samples: Deque[Tuple[float, float]] = deque(maxlen=600)
         self._utc_history: Deque[Tuple[float, float]] = deque(maxlen=360)  # (oracle_utc_ts, price)
+        self._utc_twap_history: Deque[Tuple[float, float]] = deque(maxlen=360)
         self.clock_offset_sec: float = 0.0
         self._clock_samples: Deque[float] = deque(maxlen=15)
         self._stop_event = asyncio.Event()
@@ -198,6 +199,17 @@ class ChainlinkOracleFeed:
         best_p: Optional[float] = None
         best_dt = max_diff_sec
         for ots, p in self._utc_history:
+            dt = abs(ots - target_utc_ts)
+            if dt <= best_dt:
+                best_dt = dt
+                best_p = p
+        return best_p
+
+    def get_twap_near_utc(self, target_utc_ts: float, max_diff_sec: float = 6.0) -> Optional[float]:
+        """Return the Chainlink 60s TWAP whose authoritative `oracle_ts` is closest to `target_utc_ts`."""
+        best_p: Optional[float] = None
+        best_dt = max_diff_sec
+        for ots, p in self._utc_twap_history:
             dt = abs(ots - target_utc_ts)
             if dt <= best_dt:
                 best_dt = dt
@@ -238,6 +250,8 @@ class ChainlinkOracleFeed:
             self.state.twap_60s = explicit_twap_60s
         else:
             self.state.twap_60s = self._compute_local_twap(now)
+        if self.state.twap_60s and self.state.twap_60s > 0:
+            self._utc_twap_history.append((eff_oracle_ts, float(self.state.twap_60s)))
 
     def _compute_local_twap(self, now: float) -> float:
         pts = list(self._twap_samples)
@@ -348,7 +362,13 @@ class ChainlinkOracleFeed:
 
         while not self._stop_event.is_set():
             try:
-                async with websockets.connect(POLYBOLT_WS_URL, ping_interval=20) as ws:
+                async with websockets.connect(
+                    POLYBOLT_WS_URL,
+                    ping_interval=15,
+                    ping_timeout=10,
+                    open_timeout=8,
+                    close_timeout=2,
+                ) as ws:
                     await ws.send(
                         json.dumps(
                             {
@@ -369,9 +389,8 @@ class ChainlinkOracleFeed:
                             }
                         )
                     )
-                    async for raw in ws:
-                        if self._stop_event.is_set():
-                            break
+                    while not self._stop_event.is_set():
+                        raw = await asyncio.wait_for(ws.recv(), timeout=12.0)
                         msg = json.loads(raw)
                         ch = msg.get("channel", "")
                         data = msg.get("data") or msg.get("payload") or {}
@@ -380,6 +399,7 @@ class ChainlinkOracleFeed:
                             continue
                         if ch == "price.crypto.twap":
                             self.state.twap_60s = norm_p
+                            self._utc_twap_history.append((self.utc_now(), norm_p))
                         else:
                             self.on_chainlink_tick(norm_p, "POLYBOLT_CHAINLINK")
             except Exception:

@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -744,6 +745,13 @@ class TelegramBotService:
         """Reset old `.tg_control.json` bet override when monitor starts with explicit CLI `--bet`."""
         self.control.update(bet_usdc=None, bet_updated_at=time.time())
 
+    def _reset_send_session(self) -> None:
+        try:
+            self._send_http.close()
+        except Exception:
+            pass
+        self._send_http = requests.Session()
+
     def send_message_sync(
         self,
         text: str,
@@ -754,27 +762,58 @@ class TelegramBotService:
         if not self.bot_token or not target:
             return False
 
-        payload: Dict[str, Any] = {
-            "chat_id": target,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }
-        if with_keyboard:
-            payload["reply_markup"] = REPLY_KEYBOARD
-
         url = TG_API_BASE.format(token=self.bot_token, method="sendMessage")
-        with self._send_lock:
-            try:
-                r = self._send_http.post(url, json=payload, timeout=6.0)
-                if r.status_code == 200:
-                    return True
-                # Fallback to plain text if HTML entity parsing failed
-                payload.pop("parse_mode", None)
-                r2 = self._send_http.post(url, json=payload, timeout=6.0)
-                return r2.status_code == 200
-            except Exception:
-                return False
+        is_group_or_channel = str(target).strip().startswith("-")
+        backoffs = (0.6, 1.5, 0.0)
+        last_err = ""
+        for attempt in range(3):
+            payload: Dict[str, Any] = {
+                "chat_id": target,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }
+            if with_keyboard and not is_group_or_channel:
+                payload["reply_markup"] = REPLY_KEYBOARD
+
+            sleep_sec = backoffs[attempt]
+            abort_retry = False
+            with self._send_lock:
+                try:
+                    r = self._send_http.post(url, json=payload, timeout=6.0)
+                    if r.status_code == 200:
+                        return True
+                    if r.status_code == 400 and ("parse_mode" in payload or "reply_markup" in payload):
+                        payload.pop("parse_mode", None)
+                        payload.pop("reply_markup", None)
+                        r2 = self._send_http.post(url, json=payload, timeout=6.0)
+                        if r2.status_code == 200:
+                            return True
+                        last_err = f"HTTP {r2.status_code}: {r2.text[:120]}"
+                        abort_retry = True
+                    elif r.status_code == 429:
+                        try:
+                            retry_after = float((r.json().get("parameters") or {}).get("retry_after") or 1.0)
+                        except Exception:
+                            retry_after = 1.0
+                        sleep_sec = min(5.0, max(0.5, retry_after))
+                        last_err = "HTTP 429 rate limited"
+                    elif r.status_code >= 500:
+                        last_err = f"HTTP {r.status_code}"
+                        self._reset_send_session()
+                    else:
+                        last_err = f"HTTP {r.status_code}: {r.text[:120]}"
+                        abort_retry = True
+                except Exception as exc:
+                    last_err = f"{type(exc).__name__}: {exc}"
+                    self._reset_send_session()
+            if abort_retry:
+                break
+            if attempt < 2 and sleep_sec > 0.0:
+                time.sleep(sleep_sec)
+
+        sys.stderr.write(f"[TG SEND WARN] chat={target} failed: {last_err}\n")
+        return False
 
     def get_recipient_ids(self) -> List[str]:
         ctrl = self.shared_control.load() if self.shared_control is not None else self.control.load()
@@ -788,7 +827,12 @@ class TelegramBotService:
                 ids.append(s)
         return ids
 
-    def broadcast_message_sync(self, text: str, with_keyboard: bool = True) -> bool:
+    def broadcast_message_sync(
+        self,
+        text: str,
+        with_keyboard: bool = True,
+        failure_note: str = "",
+    ) -> bool:
         targets = self.get_recipient_ids()
         if not self.bot_token or not targets:
             return False
@@ -796,16 +840,19 @@ class TelegramBotService:
         for tid in targets:
             if self.send_message_sync(text, chat_id=tid, with_keyboard=with_keyboard):
                 ok_any = True
+        if not ok_any:
+            tag = failure_note or "BROADCAST"
+            sys.stderr.write(f"[TG NOTIFY FAILED] [{self.asset_symbol}] {tag} failed across {len(targets)} recipients\n")
         return ok_any
 
-    def send_async(self, text: str) -> None:
+    def send_async(self, text: str, failure_note: str = "") -> None:
         if not self.enabled or not self.get_recipient_ids():
             return
         try:
             loop = asyncio.get_running_loop()
-            loop.run_in_executor(None, self.broadcast_message_sync, text, True)
+            loop.run_in_executor(None, self.broadcast_message_sync, text, True, failure_note)
         except RuntimeError:
-            self.broadcast_message_sync(text, True)
+            self.broadcast_message_sync(text, True, failure_note=failure_note)
 
     def notify_entry(
         self,
@@ -838,7 +885,7 @@ class TelegramBotService:
             f"▸ <b>模型指標</b>：P_true <b>{p_true_at_entry*100:.1f}%</b>  |  Z <code>{z_at_entry:+.2f}</code>"
             f"{oid_line}"
         )
-        self.send_async(msg)
+        self.send_async(msg, failure_note=f"ENTRY trade_id={trade_id}")
 
     def notify_exit(
         self,
@@ -913,7 +960,7 @@ class TelegramBotService:
             f"▸ <b>進出場價</b>：<code>${entry_price:.3f}</code> ➔ <code>${exit_payout_per_share:.4f}</code>"
             f"{stats_line}"
         )
-        self.send_async(msg)
+        self.send_async(msg, failure_note=f"EXIT trade_id={trade_id}")
 
     def notify_alert(self, title: str, detail: str) -> None:
         msg = f"<b>[{self.asset_symbol} | ALERT // {html.escape(title)}]</b>\n━━━━━━━━━━━━━━━━━━\n{html.escape(detail)}"

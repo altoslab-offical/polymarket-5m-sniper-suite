@@ -206,6 +206,8 @@ def fetch_5m_market_metadata(
             or mkt.get("startPrice")
         )
         official_strike = float(price_to_beat) if price_to_beat is not None else None
+        final_price_raw = meta.get("finalPrice") or mkt.get("finalPrice")
+        official_final_price = float(final_price_raw) if final_price_raw is not None else None
 
         resolved_winner: Optional[str] = None
         if len(outcome_prices) >= 2:
@@ -226,6 +228,7 @@ def fetch_5m_market_metadata(
             "up_token": up_token,
             "down_token": down_token,
             "official_strike": official_strike,
+            "official_final_price": official_final_price,
             "resolved_winner": resolved_winner,
         }
     except Exception:
@@ -288,6 +291,7 @@ class LiveFeedState:
     up_book_ts: float = 0.0
     down_book_ts: float = 0.0
     last_ws_book_local_ts: float = 0.0
+    last_book_update_local_ts: float = 0.0
 
     def __post_init__(self) -> None:
         if self.book is None:
@@ -305,7 +309,7 @@ class LiveFeedState:
         market makers' true Strike. Calibrates `strike_price` when >=3 early samples show a >=$12 gap.
         """
         if (
-            self.strike_source == "GAMMA_OFFICIAL"
+            self.strike_source in ("GAMMA_OFFICIAL", "POLYBOLT_TWAP_T0", "CHAINLINK_TWAP_T0")
             or cl_spot is None
             or self.strike_price is None
             or not (1.5 <= elapsed_sec <= 45.0)
@@ -415,11 +419,19 @@ class LiveMarketHub:
         if window_ts == self.state.current_window_ts:
             # Backfill exact UTC boundary price if Chainlink tick arrived a moment after rollover
             if self.state.strike_price is None:
-                near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
-                if near_p is not None:
-                    self.state.strike_price = near_p
-                    self.state._initial_cl_strike = near_p
-                    self.state.strike_source = self.chainlink.state.source
+                near_twap = self.chainlink.get_twap_near_utc(float(window_ts), max_diff_sec=5.0)
+                if near_twap is not None:
+                    self.state.strike_price = near_twap
+                    self.state._initial_cl_strike = near_twap
+                    self.state.strike_source = (
+                        "POLYBOLT_TWAP_T0" if self.chainlink.state.source == "POLYBOLT_CHAINLINK" else "CHAINLINK_TWAP_T0"
+                    )
+                else:
+                    near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
+                    if near_p is not None:
+                        self.state.strike_price = near_p
+                        self.state._initial_cl_strike = near_p
+                        self.state.strike_source = self.chainlink.state.source
             return
 
         self.state.current_window_ts = window_ts
@@ -428,6 +440,7 @@ class LiveMarketHub:
         self.state.up_book_ts = 0.0
         self.state.down_book_ts = 0.0
         self.state.last_ws_book_local_ts = 0.0
+        self.state.last_book_update_local_ts = 0.0
         self.state._implied_strike_samples.clear()
         self._gamma_strike_checks = 0
 
@@ -437,9 +450,18 @@ class LiveMarketHub:
             self.state.up_token = None
             self.state.down_token = None
 
+        near_twap = self.chainlink.get_twap_near_utc(float(window_ts), max_diff_sec=5.0)
+        if near_twap is None and self.chainlink.state.is_alive() and self.chainlink.state.twap_60s and self.chainlink.state.twap_60s > 0:
+            near_twap = float(self.chainlink.state.twap_60s)
         near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
         cl_price = near_p or self.chainlink.state.settlement_reference_price
-        if (now_utc - window_ts) < 4.5 and cl_price is not None:
+        if (now_utc - window_ts) < 4.5 and near_twap is not None:
+            self.state.strike_price = near_twap
+            self.state._initial_cl_strike = near_twap
+            self.state.strike_source = (
+                "POLYBOLT_TWAP_T0" if self.chainlink.state.source == "POLYBOLT_CHAINLINK" else "CHAINLINK_TWAP_T0"
+            )
+        elif (now_utc - window_ts) < 4.5 and cl_price is not None:
             self.state.strike_price = cl_price
             self.state._initial_cl_strike = cl_price
             self.state.strike_source = self.chainlink.state.source
@@ -592,16 +614,19 @@ class LiveMarketHub:
             window_ts = self.state.current_window_ts
             elapsed = now_utc - window_ts
 
-            # 1. Fetch Gamma metadata when tokens are missing OR up to twice after open (10s..60s)
-            #    to capture `official_strike` (`priceToBeat`) even when tokens were pre-fetched!
+            # 1. Fetch Gamma metadata when tokens are missing OR while strike lacks GAMMA_OFFICIAL
+            #    (queries current `priceToBeat` AND previous window `finalPrice`, which equals official Strike!)
             need_tokens = not self.state.up_token
+            since_gamma = now_utc - self._last_gamma_fetch_ts
             need_official_strike = (
                 self.state.strike_source != "GAMMA_OFFICIAL"
-                and 10.0 <= elapsed <= 65.0
-                and self._gamma_strike_checks < 2
-                and (now_utc - self._last_gamma_fetch_ts) >= 15.0
+                and self._gamma_strike_checks < 5
+                and (
+                    (self.state.strike_price is None and since_gamma >= 3.0)
+                    or (elapsed <= 145.0 and since_gamma >= 12.0)
+                )
             )
-            if (need_tokens and (now_utc - self._last_gamma_fetch_ts) >= 3.0) or need_official_strike:
+            if (need_tokens and since_gamma >= 3.0) or need_official_strike:
                 self._last_gamma_fetch_ts = now_utc
                 if need_official_strike:
                     self._gamma_strike_checks += 1
@@ -612,13 +637,29 @@ class LiveMarketHub:
                     if meta.get("official_strike"):
                         self.state.strike_price = meta["official_strike"]
                         self.state.strike_source = "GAMMA_OFFICIAL"
-                    elif (
-                        self.state.strike_price is None
-                        and elapsed < 5.0
-                        and self.chainlink.state.settlement_reference_price is not None
-                    ):
-                        self.state.strike_price = self.chainlink.state.settlement_reference_price
-                        self.state.strike_source = self.chainlink.state.source
+                    else:
+                        prev_meta = await loop.run_in_executor(
+                            None, fetch_5m_market_metadata, window_ts - 300, self._http
+                        )
+                        if (
+                            prev_meta
+                            and prev_meta.get("official_final_price")
+                            and self.state.current_window_ts == window_ts
+                        ):
+                            self.state.strike_price = float(prev_meta["official_final_price"])
+                            self.state._initial_cl_strike = self.state.strike_price
+                            self.state.strike_source = "GAMMA_OFFICIAL"
+                            print(
+                                f"\n🎯 [官方精準鎖定 Strike] {window_ts} = "
+                                f"${self.state.strike_price:,.4f} (GAMMA_PREV_FINAL)"
+                            )
+                        elif (
+                            self.state.strike_price is None
+                            and elapsed < 5.0
+                            and self.chainlink.state.settlement_reference_price is not None
+                        ):
+                            self.state.strike_price = self.chainlink.state.settlement_reference_price
+                            self.state.strike_source = self.chainlink.state.source
 
             # 2. Pre-fetch NEXT 5m window tokens 25s before rollover so t=0.0s book is instant!
             next_w = window_ts + 300
@@ -647,10 +688,14 @@ class LiveMarketHub:
                         self.state.book.up_bid, self.state.book.up_ask = ub, ua
                         if uts > self.state.up_book_ts:
                             self.state.up_book_ts = uts
+                        if ub is not None or ua is not None:
+                            self.state.last_book_update_local_ts = time.time()
                     if dts <= 0.0 or dts >= self.state.down_book_ts - 0.05:
                         self.state.book.down_bid, self.state.book.down_ask = db, da
                         if dts > self.state.down_book_ts:
                             self.state.down_book_ts = dts
+                        if db is not None or da is not None:
+                            self.state.last_book_update_local_ts = time.time()
 
             await asyncio.sleep(1.2)
 
@@ -701,6 +746,7 @@ class LiveMarketHub:
                                     if ev_ts > self.state.up_book_ts:
                                         self.state.up_book_ts = ev_ts
                                     self.state.last_ws_book_local_ts = time.time()
+                                    self.state.last_book_update_local_ts = self.state.last_ws_book_local_ts
                                     if bid is not None and bid >= 0.92 and (self.state.book.down_bid or 0.0) >= 0.20:
                                         self.state.book.down_bid = None
                                         self.state.book.down_ask = round(max(0.01, 1.0 - bid), 2)
@@ -709,6 +755,7 @@ class LiveMarketHub:
                                     if ev_ts > self.state.down_book_ts:
                                         self.state.down_book_ts = ev_ts
                                     self.state.last_ws_book_local_ts = time.time()
+                                    self.state.last_book_update_local_ts = self.state.last_ws_book_local_ts
                                     if bid is not None and bid >= 0.92 and (self.state.book.up_bid or 0.0) >= 0.20:
                                         self.state.book.up_bid = None
                                         self.state.book.up_ask = round(max(0.01, 1.0 - bid), 2)
