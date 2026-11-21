@@ -1,0 +1,16 @@
+.env
+*.env
+!.env.example
+data/*.db
+data/*.db-*
+data/.tg_control.json
+*.lock
+logs/
+reports/
+shared_live_risk.json
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
