@@ -36,6 +36,7 @@ class LiveFillResult:
     avg_price: float
     order_id: str = ""
     error: Optional[str] = None
+    latency_ms: float = 0.0
 
 
 def parse_clob_fill_response(resp: object, requested_price: float) -> LiveFillResult:
@@ -283,8 +284,15 @@ class PolymarketLiveExecutor:
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
         from .fees import taker_fee_per_share
 
+        t0 = time.perf_counter()
         if self.circuit_broken:
-            return LiveFillResult(False, 0.0, ask_price, error="DAILY_LOSS_CIRCUIT_BREAKER_ACTIVE")
+            return LiveFillResult(
+                False,
+                0.0,
+                ask_price,
+                error="DAILY_LOSS_CIRCUIT_BREAKER_ACTIVE",
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
 
         # EV-guarded slippage cushion: allow up to +4c ONLY if NetEV at limit_px remains >= +3.5c (strictly <= max_price)
         limit_px = round(min(max_price, float(ask_price) + 0.01), 2)
@@ -304,7 +312,13 @@ class PolymarketLiveExecutor:
         else:
             usdc_amount = round(float(shares) * float(ask_price), 2)
         if usdc_amount < 1.0 or limit_px <= 0.01:
-            return LiveFillResult(False, 0.0, limit_px, error="Invalid order size or price")
+            return LiveFillResult(
+                False,
+                0.0,
+                limit_px,
+                error="Invalid order size or price",
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
 
         tick_size = self._get_tick_size_cached(token_id)
 
@@ -325,6 +339,7 @@ class PolymarketLiveExecutor:
             res = self._verify_fill_if_needed(res, limit_px, est_shares=usdc_amount / limit_px)
             if res.filled and res.filled_shares > 0.0:
                 self._cond_balance_cache.pop(token_id, None)
+            res.latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
             return res
         except Exception as exc:
             err_str = str(exc)
@@ -339,7 +354,13 @@ class PolymarketLiveExecutor:
                 except Exception:
                     pass
                 err_str = f"可用 pUSD 餘額不足（若有到期獲勝注單尚未領取，請至 Polymarket 點擊 Claim 領回 pUSD）| {err_str}"
-            return LiveFillResult(False, 0.0, limit_px, error=err_str)
+            return LiveFillResult(
+                False,
+                0.0,
+                limit_px,
+                error=err_str,
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
 
     def execute_exit(
         self,
@@ -350,6 +371,7 @@ class PolymarketLiveExecutor:
     ) -> LiveFillResult:
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
 
+        t0 = time.perf_counter()
         # Fast-path: use background-prefetched conditional balance (0ms extra latency); sync on demand if missing
         cached_avail = self._cond_balance_cache.get(token_id, 0.0)
         if cached_avail <= 0.0:
@@ -360,7 +382,13 @@ class PolymarketLiveExecutor:
             sell_qty = floor_share_qty(min(sell_qty, cached_avail))
 
         if sell_qty < 0.1:
-            return LiveFillResult(False, 0.0, bid_price, error="No conditional balance to sell")
+            return LiveFillResult(
+                False,
+                0.0,
+                bid_price,
+                error="No conditional balance to sell",
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
 
         limit_px = round(max(0.01, float(bid_price) - slippage_cents), 2)
         tick_size = self._get_tick_size_cached(token_id)
@@ -380,12 +408,22 @@ class PolymarketLiveExecutor:
                 )
                 res = parse_clob_fill_response(resp, limit_px)
                 res = self._verify_fill_if_needed(res, limit_px, est_shares=sell_qty)
+                if (
+                    attempt == 0
+                    and not res.filled
+                    and res.error
+                    and "no orders found to match" in res.error.lower()
+                    and slippage_cents >= 0.05
+                ):
+                    limit_px = round(max(0.01, float(bid_price) - (slippage_cents + 0.05)), 2)
+                    continue
                 if res.filled and res.filled_shares > 0.0:
                     rem = floor_share_qty(max(0.0, sell_qty - res.filled_shares))
                     if rem >= 0.1:
                         self._cond_balance_cache[token_id] = rem
                     else:
                         self._cond_balance_cache.pop(token_id, None)
+                res.latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
                 return res
             except Exception as exc:
                 err_str = str(exc)
@@ -394,5 +432,20 @@ class PolymarketLiveExecutor:
                     if fresh_avail >= 0.1:
                         sell_qty = floor_share_qty(min(float(shares), fresh_avail))
                         continue
-                return LiveFillResult(False, 0.0, limit_px, error=err_str)
-        return LiveFillResult(False, 0.0, limit_px, error="Exit retry exhausted")
+                elif attempt == 0 and "no orders found to match" in err_str.lower() and slippage_cents >= 0.05:
+                    limit_px = round(max(0.01, float(bid_price) - (slippage_cents + 0.05)), 2)
+                    continue
+                return LiveFillResult(
+                    False,
+                    0.0,
+                    limit_px,
+                    error=err_str,
+                    latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+                )
+        return LiveFillResult(
+            False,
+            0.0,
+            limit_px,
+            error="Exit retry exhausted",
+            latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+        )

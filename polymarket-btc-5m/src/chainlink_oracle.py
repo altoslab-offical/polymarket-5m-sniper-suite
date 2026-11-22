@@ -462,6 +462,7 @@ class ChainlinkOracleFeed:
                         if "btc" not in sym:
                             continue
 
+                        last_btc_tick_ts = time.time()
                         if (
                             self.state.source in ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK")
                             and (time.time() - self.state.local_recv_ts) < 2.0

@@ -105,15 +105,25 @@ class SharedDailyRiskGuard:
         tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self.state_path)
 
-    def _build_new_day_state(self, cur_day: int, equity: float, ts: float) -> dict[str, Any]:
+    def _build_new_day_state(
+        self,
+        cur_day: int,
+        equity: float,
+        ts: float,
+        prev_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         eq = max(0.0, float(equity))
         cap = max(self.min_loss_cap_usd, round(eq * self.max_daily_loss_pct, 2))
+        prev = prev_state or {}
         return {
             "day_utc": cur_day,
             "day_start_equity": round(eq, 4),
             "daily_realized_pnl_usdc": 0.0,
             "max_daily_loss_usdc": cap,
             "circuit_broken": False,
+            "cached_balance_usdc": float(prev.get("cached_balance_usdc") or 0.0),
+            "cached_balance_ts": float(prev.get("cached_balance_ts") or 0.0),
+            "pending_spend_usdc": float(prev.get("pending_spend_usdc") or 0.0),
             "last_updated_ts": ts,
         }
 
@@ -128,9 +138,60 @@ class SharedDailyRiskGuard:
                 or int(state.get("day_utc", -1)) != cur_day
                 or float(state.get("day_start_equity", 0.0)) <= 0.0
             ):
-                state = self._build_new_day_state(cur_day, live_equity, ts)
+                state = self._build_new_day_state(cur_day, live_equity, ts, prev_state=state)
                 self._write_state_unlocked(state)
             return dict(state)
+
+    def record_balance(self, balance_usdc: float, now_ts: float | None = None) -> None:
+        """Record a fresh pUSD wallet balance snapshot and clear pending intra-batch spend."""
+        ts = time.time() if now_ts is None else float(now_ts)
+        cur_day = int(ts // 86400)
+        bal = round(max(0.0, float(balance_usdc)), 4)
+        with self._state_lock():
+            state = self._read_state_unlocked()
+            if not state:
+                state = self._build_new_day_state(cur_day, bal, ts)
+            state["cached_balance_usdc"] = bal
+            state["cached_balance_ts"] = ts
+            state["pending_spend_usdc"] = 0.0
+            state["last_updated_ts"] = ts
+            self._write_state_unlocked(state)
+
+    def record_spend(self, spent_usdc: float, now_ts: float | None = None) -> None:
+        """Deduct filled order spend immediately so sibling runners avoid stale cached equity."""
+        spend = max(0.0, float(spent_usdc))
+        if spend <= 0.0:
+            return
+        ts = time.time() if now_ts is None else float(now_ts)
+        cur_day = int(ts // 86400)
+        with self._state_lock():
+            state = self._read_state_unlocked()
+            if not state:
+                state = self._build_new_day_state(cur_day, 0.0, ts)
+            prev_spend = float(state.get("pending_spend_usdc") or 0.0)
+            state["pending_spend_usdc"] = round(prev_spend + spend, 4)
+            state["last_updated_ts"] = ts
+            self._write_state_unlocked(state)
+
+    def get_fast_balance(
+        self,
+        max_age_sec: float = 25.0,
+        min_safe_usdc: float = 10.0,
+        now_ts: float | None = None,
+    ) -> float | None:
+        """Return fresh cached pUSD minus pending spend if recent and safely above `min_safe_usdc`."""
+        ts = time.time() if now_ts is None else float(now_ts)
+        with self._state_lock():
+            state = self._read_state_unlocked()
+            cached_ts = float(state.get("cached_balance_ts") or 0.0)
+            if cached_ts <= 0.0 or (ts - cached_ts) > float(max_age_sec):
+                return None
+            eff = float(state.get("cached_balance_usdc") or 0.0) - float(
+                state.get("pending_spend_usdc") or 0.0
+            )
+            if eff < float(min_safe_usdc):
+                return None
+            return round(eff, 4)
 
     def record_pnl(
         self,
@@ -146,7 +207,7 @@ class SharedDailyRiskGuard:
             if not state or int(state.get("day_utc", -1)) != cur_day:
                 fallback_eq = float(state.get("day_start_equity") or 40.0)
                 base_eq = float(current_equity) if (current_equity is not None and current_equity > 0.0) else fallback_eq
-                state = self._build_new_day_state(cur_day, base_eq, ts)
+                state = self._build_new_day_state(cur_day, base_eq, ts, prev_state=state)
             new_pnl = round(float(state.get("daily_realized_pnl_usdc") or 0.0) + float(pnl_usdc), 4)
             cap = float(state.get("max_daily_loss_usdc") or self.min_loss_cap_usd)
             broken = bool(state.get("circuit_broken", False)) or (new_pnl <= -cap)

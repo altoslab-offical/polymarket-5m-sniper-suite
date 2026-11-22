@@ -23,6 +23,23 @@
 
 ---
 
+## v4.4 執行速度與穩定度強化（Zero-Side-Effect，100% 保留 v4.2 策略與頻率）
+
+> `config.py`、`pricing_model.py`、`strategy.py`、`feeds.py` 完全未動，**0 影響開單門檻與頻率**，專注壓低實盤進／出場延遲並消除連線與檔案鎖風險：
+
+1. **狙擊熱區 4Hz（`250ms`）高頻掃描 ＋ 嚴格 1Hz 寫盤／指標節流**
+   - `148s~258s` 狙擊窗口及持倉盯盤期間主迴圈切換為 `0.25s` 評估，縮短進場確認與停利／止損觸發反應時間；EWMA 基差、TG 控制檔、SQLite 寫入與主控台輸出嚴格鎖定 `1Hz`（`is_1hz_tick`），不改變指標動態。
+2. **進場前 Zero-RTT 共用 `pUSD` 快取（省下 ~`240ms` RPC 來回）**
+   - [shared_risk.py](./shared_risk.py) 新增原子檔案鎖快取（`record_balance` / `record_spend` / `get_fast_balance`），餘額距今 `<= 25s` 且扣除已成交花費後仍 `>= $10` 時跳過下單鎖內的同步 RPC 查詢，讓三幣並發搶單不超押且更快成交。
+3. **RTDS 預言機熱備援不空斷（消除每日約 25,920 次無意義斷線重連）**
+   - `_rtds_chainlink_ws_loop` 在確認 `PolyBolt` 健康而略過重複報價前先更新心跳時間戳，維持 RTDS WebSocket 常駐熱備援，PolyBolt 一斷線可 `0ms` 無縫接手。
+4. **CLOB HTTP/2 保活提頻（`15s`）＋ 條件代幣餘額重試預抓（`4s / 8s / 13s`）**
+   - `90s~295s` 每 `15s` 主動保活 CLOB HTTP/2 長連線，避免 `5m` 尾盤停利前連線冷卻；成交後於背景連試 3 次預抓條件代幣餘額，並於進／平倉日誌實測顯示 `耗時 XXms`。
+5. **緊急止損 FAK 滑價加寬重試 ＋ 迴圈異常看門狗 ＋ SQLite 防鎖死**
+   - `EMERGENCY_STOP_LOSS`（`slippage >= 5¢`）遇 `no orders found to match` 立即加寬 `5¢` 原地重送 1 次並於 `250ms` 後再掃描（`EARLY_TAKE_PROFIT` 保持嚴格不退讓）；主迴圈包覆 `[MONITOR LOOP WARN]` 退避重試不閃退；SQLite 統一開啟 `timeout=5.0`、`WAL`、`synchronous=NORMAL`、`busy_timeout=5000`。
+
+---
+
 ## v4.3.1 穩定度升級（100% 保留 v4.2 原版 Strike 與進場頻率）
 
 > **重要回歸說明**：原版 v4.2 策略參數（如 `min_1s_vol_floor`、Student-t 肥尾與 `7%` Taker 手續費）是針對 **`t=0` Chainlink Spot + `BOOK_CALIBRATED`** 所校準。v4.3 曾短暫改為 `POLYBOLT_TWAP_T0` 導致模型 Z 值與盤口基準錯位、觸發頻率歸零；**`v4.3.1` 已 100% 還原 v4.2 原版 Strike 與進場邏輯**，僅保留以下五項零副作用可靠性升級：
@@ -51,6 +68,7 @@ polymarket-5m-sniper-suite/
 ├── test_live_sizing_risk.py
 ├── test_daily_review.py
 ├── test_upgrades_v43.py
+├── test_upgrades_v44.py
 ├── polymarket-btc-5m/      # BTC 5m 監控＋下單（Telegram 主控）
 ├── polymarket-eth-5m/      # ETH 5m 監控＋下單（單向推播）
 └── polymarket-sol-5m/      # SOL 5m 監控＋下單（單向推播）
@@ -102,8 +120,8 @@ cd polymarket-btc-5m
 ### 5. 執行單元測試與每日唯讀健檢
 
 ```bash
-# 執行全部測試（等比倉位、日熔斷、健檢、v4.3 升級與三幣核心邏輯）
-.venv/bin/pytest -q test_live_sizing_risk.py test_daily_review.py test_upgrades_v43.py
+# 執行全部測試（等比倉位、日熔斷、健檢、v4.3/v4.4 升級與三幣核心邏輯）
+.venv/bin/pytest -q test_live_sizing_risk.py test_daily_review.py test_upgrades_v43.py test_upgrades_v44.py
 (cd polymarket-btc-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-eth-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-sol-5m && ../.venv/bin/pytest -q tests/)

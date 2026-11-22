@@ -10,8 +10,10 @@ class MarketDataStorage:
     def __init__(self, db_path: str = "data/live_eth_5m.db"):
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path)
+        self.conn = sqlite3.connect(self.db_path, timeout=5.0)
         self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA busy_timeout=5000;")
         self._init_schema()
 
     def _init_schema(self) -> None:
