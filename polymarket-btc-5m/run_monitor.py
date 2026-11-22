@@ -734,8 +734,8 @@ async def monitor_loop(
                             (
                                 "clob",
                                 (now_wall - st.last_book_update_local_ts)
-                                if (st.up_token and st.last_book_update_local_ts > 0)
-                                else (999.0 if st.up_token else 0.0),
+                                if st.last_book_update_local_ts > 0.0
+                                else (elapsed if st.up_token else 0.0),
                             ),
                             ("binance", now_wall - st.binance_ts if st.binance_ts > 0 else 999.0),
                         )
