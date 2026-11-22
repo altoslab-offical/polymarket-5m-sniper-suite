@@ -309,7 +309,7 @@ class LiveFeedState:
         market makers' true Strike. Calibrates `strike_price` when >=3 early samples show a >=$12 gap.
         """
         if (
-            self.strike_source in ("GAMMA_OFFICIAL", "POLYBOLT_TWAP_T0", "CHAINLINK_TWAP_T0")
+            self.strike_source == "GAMMA_OFFICIAL"
             or cl_spot is None
             or self.strike_price is None
             or not (1.5 <= elapsed_sec <= 45.0)
@@ -419,19 +419,11 @@ class LiveMarketHub:
         if window_ts == self.state.current_window_ts:
             # Backfill exact UTC boundary price if Chainlink tick arrived a moment after rollover
             if self.state.strike_price is None:
-                near_twap = self.chainlink.get_twap_near_utc(float(window_ts), max_diff_sec=5.0)
-                if near_twap is not None:
-                    self.state.strike_price = near_twap
-                    self.state._initial_cl_strike = near_twap
-                    self.state.strike_source = (
-                        "POLYBOLT_TWAP_T0" if self.chainlink.state.source == "POLYBOLT_CHAINLINK" else "CHAINLINK_TWAP_T0"
-                    )
-                else:
-                    near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
-                    if near_p is not None:
-                        self.state.strike_price = near_p
-                        self.state._initial_cl_strike = near_p
-                        self.state.strike_source = self.chainlink.state.source
+                near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
+                if near_p is not None:
+                    self.state.strike_price = near_p
+                    self.state._initial_cl_strike = near_p
+                    self.state.strike_source = self.chainlink.state.source
             return
 
         self.state.current_window_ts = window_ts
@@ -450,18 +442,9 @@ class LiveMarketHub:
             self.state.up_token = None
             self.state.down_token = None
 
-        near_twap = self.chainlink.get_twap_near_utc(float(window_ts), max_diff_sec=5.0)
-        if near_twap is None and self.chainlink.state.is_alive() and self.chainlink.state.twap_60s and self.chainlink.state.twap_60s > 0:
-            near_twap = float(self.chainlink.state.twap_60s)
         near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
         cl_price = near_p or self.chainlink.state.settlement_reference_price
-        if (now_utc - window_ts) < 4.5 and near_twap is not None:
-            self.state.strike_price = near_twap
-            self.state._initial_cl_strike = near_twap
-            self.state.strike_source = (
-                "POLYBOLT_TWAP_T0" if self.chainlink.state.source == "POLYBOLT_CHAINLINK" else "CHAINLINK_TWAP_T0"
-            )
-        elif (now_utc - window_ts) < 4.5 and cl_price is not None:
+        if (now_utc - window_ts) < 4.5 and cl_price is not None:
             self.state.strike_price = cl_price
             self.state._initial_cl_strike = cl_price
             self.state.strike_source = self.chainlink.state.source
@@ -614,19 +597,16 @@ class LiveMarketHub:
             window_ts = self.state.current_window_ts
             elapsed = now_utc - window_ts
 
-            # 1. Fetch Gamma metadata when tokens are missing OR while strike lacks GAMMA_OFFICIAL
-            #    (queries current `priceToBeat` AND previous window `finalPrice`, which equals official Strike!)
+            # 1. Fetch Gamma metadata when tokens are missing OR up to twice after open (10s..60s)
+            #    to capture `official_strike` (`priceToBeat`) even when tokens were pre-fetched!
             need_tokens = not self.state.up_token
-            since_gamma = now_utc - self._last_gamma_fetch_ts
             need_official_strike = (
                 self.state.strike_source != "GAMMA_OFFICIAL"
-                and self._gamma_strike_checks < 5
-                and (
-                    (self.state.strike_price is None and since_gamma >= 3.0)
-                    or (elapsed <= 145.0 and since_gamma >= 12.0)
-                )
+                and 10.0 <= elapsed <= 65.0
+                and self._gamma_strike_checks < 2
+                and (now_utc - self._last_gamma_fetch_ts) >= 15.0
             )
-            if (need_tokens and since_gamma >= 3.0) or need_official_strike:
+            if (need_tokens and (now_utc - self._last_gamma_fetch_ts) >= 3.0) or need_official_strike:
                 self._last_gamma_fetch_ts = now_utc
                 if need_official_strike:
                     self._gamma_strike_checks += 1
@@ -637,29 +617,13 @@ class LiveMarketHub:
                     if meta.get("official_strike"):
                         self.state.strike_price = meta["official_strike"]
                         self.state.strike_source = "GAMMA_OFFICIAL"
-                    else:
-                        prev_meta = await loop.run_in_executor(
-                            None, fetch_5m_market_metadata, window_ts - 300, self._http
-                        )
-                        if (
-                            prev_meta
-                            and prev_meta.get("official_final_price")
-                            and self.state.current_window_ts == window_ts
-                        ):
-                            self.state.strike_price = float(prev_meta["official_final_price"])
-                            self.state._initial_cl_strike = self.state.strike_price
-                            self.state.strike_source = "GAMMA_OFFICIAL"
-                            print(
-                                f"\n🎯 [官方精準鎖定 Strike] {window_ts} = "
-                                f"${self.state.strike_price:,.4f} (GAMMA_PREV_FINAL)"
-                            )
-                        elif (
-                            self.state.strike_price is None
-                            and elapsed < 5.0
-                            and self.chainlink.state.settlement_reference_price is not None
-                        ):
-                            self.state.strike_price = self.chainlink.state.settlement_reference_price
-                            self.state.strike_source = self.chainlink.state.source
+                    elif (
+                        self.state.strike_price is None
+                        and elapsed < 5.0
+                        and self.chainlink.state.settlement_reference_price is not None
+                    ):
+                        self.state.strike_price = self.chainlink.state.settlement_reference_price
+                        self.state.strike_source = self.chainlink.state.source
 
             # 2. Pre-fetch NEXT 5m window tokens 25s before rollover so t=0.0s book is instant!
             next_w = window_ts + 300

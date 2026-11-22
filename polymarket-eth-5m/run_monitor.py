@@ -74,15 +74,6 @@ async def resolve_official_polymarket_outcome(
     for delay in (8.0, 15.0, 22.0):
         await asyncio.sleep(delay)
         meta = await loop.run_in_executor(None, fetch_5m_market_metadata, prev_window_ts, hub._http)
-        if meta and meta.get("official_final_price"):
-            cur_st = hub.state
-            if cur_st.current_window_ts == prev_window_ts + 300 and cur_st.strike_source != "GAMMA_OFFICIAL":
-                cur_st.strike_price = float(meta["official_final_price"])
-                cur_st.strike_source = "GAMMA_OFFICIAL"
-                print(
-                    f"\n🎯 [官方精準鎖定 Strike] {cur_st.current_window_ts} = "
-                    f"${cur_st.strike_price:,.4f} (GAMMA_PREV_FINAL)"
-                )
         if meta and meta.get("resolved_winner"):
             official_winner = meta["resolved_winner"]
             if meta.get("official_strike"):

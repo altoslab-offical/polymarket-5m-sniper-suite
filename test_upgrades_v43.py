@@ -47,7 +47,8 @@ def _load_coin_modules(coin_dir_name: str) -> Dict[str, types.ModuleType]:
 
 
 @pytest.mark.parametrize("coin_dir", COIN_DIRS)
-def test_twap_near_utc_and_boundary_priority(coin_dir: str) -> None:
+def test_sync_window_boundary_preserves_v42_spot_strike(coin_dir: str) -> None:
+    """Verify Chainlink TWAP lookup stays intact while boundary Strike keeps exact v4.2 Spot."""
     mods = _load_coin_modules(coin_dir)
     ChainlinkOracleFeed = mods["chainlink_oracle"].ChainlinkOracleFeed
     LiveMarketHub = mods["feeds"].LiveMarketHub
@@ -86,34 +87,38 @@ def test_twap_near_utc_and_boundary_priority(coin_dir: str) -> None:
     )
     hub.sync_window_boundary(boundary_ts + 0.4)
     assert hub.state.current_window_ts == int(boundary_ts)
-    assert hub.state.strike_price == pytest.approx(90042.5)
-    assert hub.state.strike_source == "POLYBOLT_TWAP_T0"
+    assert hub.state.strike_price == pytest.approx(90200.0)
+    assert hub.state.strike_source == "POLYBOLT_CHAINLINK"
 
 
 @pytest.mark.parametrize("coin_dir", COIN_DIRS)
-@pytest.mark.parametrize(
-    "protected_source",
-    ("GAMMA_OFFICIAL", "POLYBOLT_TWAP_T0", "CHAINLINK_TWAP_T0"),
-)
-def test_calibrate_strike_preserves_official_and_twap_t0(
-    coin_dir: str, protected_source: str
-) -> None:
+def test_calibrate_strike_preserves_gamma_official_only(coin_dir: str) -> None:
+    """Protect only GAMMA_OFFICIAL from opening-book calibration while allowing Spot calibration."""
     mods = _load_coin_modules(coin_dir)
     LiveFeedState = mods["feeds"].LiveFeedState
     OrderBookTop = mods["strategy"].OrderBookTop
 
-    st = LiveFeedState()
-    st.current_window_ts = 1795200000
-    st.strike_price = 100.25
-    st.strike_source = protected_source
-    st.book = OrderBookTop(up_bid=0.60, up_ask=0.62, down_bid=0.38, down_ask=0.40)
-
-    res = st.calibrate_strike_from_opening_book(
-        cl_spot=101.0, vol_1s=0.0005, elapsed_sec=5.0
+    st_off = LiveFeedState()
+    st_off.current_window_ts = 1795200000
+    st_off.strike_price = 90000.0
+    st_off.strike_source = "GAMMA_OFFICIAL"
+    st_off.book = OrderBookTop(up_bid=0.70, up_ask=0.72, down_bid=0.28, down_ask=0.30)
+    res_off = st_off.calibrate_strike_from_opening_book(
+        cl_spot=90000.0, vol_1s=0.0005, elapsed_sec=5.0
     )
-    assert res is None
-    assert st.strike_price == pytest.approx(100.25)
-    assert st.strike_source == protected_source
+    assert res_off is None
+    assert st_off.strike_price == pytest.approx(90000.0)
+    assert len(st_off._implied_strike_samples) == 0
+
+    st_spot = LiveFeedState()
+    st_spot.current_window_ts = 1795200000
+    st_spot.strike_price = 90000.0
+    st_spot.strike_source = "POLYBOLT_CHAINLINK"
+    st_spot.book = OrderBookTop(up_bid=0.70, up_ask=0.72, down_bid=0.28, down_ask=0.30)
+    st_spot.calibrate_strike_from_opening_book(
+        cl_spot=90000.0, vol_1s=0.0005, elapsed_sec=5.0
+    )
+    assert len(st_spot._implied_strike_samples) == 1
 
 
 @pytest.mark.parametrize("coin_dir", COIN_DIRS)
@@ -314,8 +319,9 @@ def test_tg_channel_omits_reply_keyboard_and_400_fallback(
 
 @pytest.mark.parametrize("coin_dir", COIN_DIRS)
 def test_run_monitor_v43_guards_present(coin_dir: str) -> None:
+    """Confirm v4.3.1 reliability guards stay active while GAMMA_PREV_FINAL override is removed."""
     text = (FRIEND_ROOT / coin_dir / "run_monitor.py").read_text(encoding="utf-8")
-    assert "GAMMA_PREV_FINAL" in text
+    assert "GAMMA_PREV_FINAL" not in text
     assert "last_book_update_local_ts" in text
     assert "book_age > 5.0" in text
     assert "fee_rate=cfg.crypto_taker_fee_rate" in text
