@@ -323,6 +323,6 @@ def test_run_monitor_v43_guards_present(coin_dir: str) -> None:
     text = (FRIEND_ROOT / coin_dir / "run_monitor.py").read_text(encoding="utf-8")
     assert "GAMMA_PREV_FINAL" not in text
     assert "last_book_update_local_ts" in text
-    assert "book_age > 5.0" in text
+    assert "book_age > 1.5 or book_lag > 1.0" in text
     assert "fee_rate=cfg.crypto_taker_fee_rate" in text
     assert "live_exec.get_pusd_balance" in text

@@ -5,6 +5,7 @@ data/*.db
 data/*.db-*
 data/.tg_control.json
 *.lock
+!requirements.lock
 logs/
 reports/
 shared_live_risk.json

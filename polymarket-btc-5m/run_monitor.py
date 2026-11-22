@@ -7,6 +7,8 @@ Usage:
 import argparse
 import asyncio
 from dataclasses import replace
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import shutil
@@ -21,17 +23,123 @@ if str(_SHARED_ROOT) not in sys.path:
 
 from shared_risk import SharedDailyRiskGuard, compute_proportional_shares
 from src.chainlink_oracle import has_websockets_installed
-from src.config import DEFAULT_CONFIG
+from src.config import DEFAULT_CONFIG, StrategyConfig
 from src.fees import effective_exit_proceeds, taker_fee_per_share
 from src.feeds import LiveMarketHub, fetch_5m_market_metadata
 from src.live_executor import LiveFillResult, PolymarketLiveExecutor
 from src.pricing_model import RollingMicrostructureTracker, estimate_fair_value
 from src.storage import MarketDataStorage
-from src.strategy import HighProbSniperStrategy
+from src.strategy import HighProbSniperStrategy, Position
 from src.tg_notifier import TelegramBotService
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _setup_event_logger(coin: str, log_file: str) -> Optional[logging.Logger]:
+    """Configure a 50MB x 5 RotatingFileHandler for structured monitor events."""
+    path_str = (log_file or "").strip()
+    if not path_str:
+        return None
+    abs_path = Path(path_str).expanduser().resolve()
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(f"poly5m.{coin.lower()}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+        h.close()
+    handler = RotatingFileHandler(
+        abs_path,
+        maxBytes=50 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+    return logger
+
+
+def reconcile_startup_position(
+    window_ts: int,
+    elapsed_sec: float,
+    up_token: str,
+    down_token: str,
+    live_exec: PolymarketLiveExecutor,
+    storage: MarketDataStorage,
+    strategy: HighProbSniperStrategy,
+    cfg: StrategyConfig,
+    now_ts: float,
+    up_mid_fallback: Optional[float] = None,
+    down_mid_fallback: Optional[float] = None,
+) -> Optional[int]:
+    """Inspect conditional wallet balances at startup and adopt any live 5m position into strategy state."""
+    up_bal = live_exec.sync_conditional_balance(up_token)
+    dn_bal = live_exec.sync_conditional_balance(down_token)
+    if up_bal >= 0.5:
+        side, shares, token_id, mid_fb = "UP", up_bal, up_token, up_mid_fallback
+    elif dn_bal >= 0.5:
+        side, shares, token_id, mid_fb = "DOWN", dn_bal, down_token, down_mid_fallback
+    else:
+        return None
+
+    db_row = storage.conn.execute(
+        """
+        SELECT id, side, entry_ts, entry_elapsed_sec, shares, entry_price,
+               entry_fee_per_share, p_true_at_entry, z_at_entry
+        FROM paper_trades
+        WHERE window_ts = ? AND exit_ts IS NULL
+        ORDER BY id DESC LIMIT 1
+        """,
+        (window_ts,),
+    ).fetchone()
+
+    _, tr_px = live_exec.lookup_recent_buy_fill(token_id, float(window_ts) - 5.0)
+    if tr_px > 0.0:
+        entry_px = tr_px
+    elif db_row and db_row[1] == side and float(db_row[5] or 0.0) > 0.0:
+        entry_px = float(db_row[5])
+    elif mid_fb is not None and 0.05 <= mid_fb <= 0.95:
+        entry_px = float(mid_fb)
+    else:
+        entry_px = 0.78
+
+    fee_ps = taker_fee_per_share(entry_px, cfg.crypto_taker_fee_rate)
+    p_true = float(db_row[7]) if (db_row and db_row[1] == side) else max(cfg.min_true_prob, min(0.95, entry_px + 0.08))
+    z_val = float(db_row[8]) if (db_row and db_row[1] == side) else cfg.min_z_score
+    ent_ts = float(db_row[2]) if (db_row and db_row[1] == side) else now_ts
+    ent_el = float(db_row[3]) if (db_row and db_row[1] == side) else elapsed_sec
+
+    if db_row and db_row[1] == side:
+        db_id = int(db_row[0])
+    else:
+        db_id = storage.insert_paper_trade(
+            window_ts=window_ts,
+            side=side,
+            entry_ts=ent_ts,
+            entry_elapsed_sec=ent_el,
+            shares=shares,
+            entry_price=entry_px,
+            entry_fee_per_share=fee_ps,
+            p_true_at_entry=p_true,
+            z_at_entry=z_val,
+        )
+
+    strategy.active_position = Position(
+        window_ts=window_ts,
+        side=side,
+        entry_ts=ent_ts,
+        entry_elapsed_sec=ent_el,
+        shares=shares,
+        entry_price=entry_px,
+        fee_per_share=fee_ps,
+        total_cost_per_share=entry_px + fee_ps,
+        p_true_at_entry=p_true,
+        z_at_entry=z_val,
+        db_trade_id=db_id,
+    )
+    strategy.traded_windows.add(window_ts)
+    return db_id
 
 
 def _fit_console_line(text: str) -> str:
@@ -63,11 +171,19 @@ async def resolve_official_polymarket_outcome(
     live_exec: Optional[PolymarketLiveExecutor] = None,
     tg: Optional[TelegramBotService] = None,
     shared_risk: Optional[SharedDailyRiskGuard] = None,
+    event_logger: Optional[logging.Logger] = None,
 ) -> None:
     """
     Wait ~6-15s in background after 5m close to verify Polymarket Gamma API's OFFICIAL settled
     outcome (`outcomePrices`), avoiding false `UP` ties when an on-chain push feed didn't tick!
     """
+    def _emit_res(msg: str) -> None:
+        clean = str(msg).strip()
+        if event_logger is not None and clean:
+            event_logger.info(clean)
+        if sys.stdout.isatty() or event_logger is None:
+            print(msg, flush=True)
+
     loop = asyncio.get_running_loop()
     official_winner: Optional[str] = None
 
@@ -95,7 +211,7 @@ async def resolve_official_polymarket_outcome(
             official_winner = "UP" if cl_close >= prev_strike else "DOWN"
             winner_src = hub.chainlink.state.source
         else:
-            print(f"\n>>> [5m 結算略過 {prev_window_ts}] 無法確認官方結算方向 (預言機未跳動且 Gamma 尚未公佈)")
+            _emit_res(f">>> [5m 結算略過 {prev_window_ts}] 無法確認官方結算方向 (預言機未跳動且 Gamma 尚未公佈)")
             return
 
     now_utc = hub.utc_now()
@@ -116,12 +232,12 @@ async def resolve_official_polymarket_outcome(
 
     s0_str = f"{prev_strike:,.2f}" if prev_strike else "N/A"
     st_str = f"{cl_close:,.2f}" if cl_close else "N/A"
-    print(
-        f"\n>>> [5m 官方結算 {prev_window_ts}] S0={s0_str} -> ST={st_str} "
+    _emit_res(
+        f">>> [5m 官方結算 {prev_window_ts}] S0={s0_str} -> ST={st_str} "
         f"=> 結果: {official_winner} (裁判來源: {winner_src})"
     )
     if settle_msg:
-        print(f">>> {settle_msg}")
+        _emit_res(f">>> {settle_msg}")
         if active_db_trade_id is not None and strategy.closed_trades:
             last = strategy.closed_trades[-1]
             delta_pnl = last.net_pnl_usdc - prior_partial_pnl
@@ -170,14 +286,14 @@ async def resolve_official_polymarket_outcome(
         stats = strategy.summary_stats()
         tag = "累積實盤戰績" if live_exec is not None else "累積模擬戰績"
         unit = "pUSD" if live_exec is not None else "USDC"
-        print(
+        _emit_res(
             f">>> [{tag}] 總單數={stats['trades']} | "
             f"勝率={stats['win_rate_pct']:.1f}% | "
             f"總損益={stats['net_pnl_usdc']:+.2f} {unit} | "
             f"帳戶餘額=${stats['final_bankroll']:,.2f}"
         )
         if live_exec is not None and strategy.closed_trades and strategy.closed_trades[-1].won:
-            print(">>> 💡 [實盤提示] 到期獲勝注單請記得定期至 Polymarket 網頁點擊 Claim 領回 pUSD 餘額。")
+            _emit_res(">>> 💡 [實盤提示] 到期獲勝注單請記得定期至 Polymarket 網頁點擊 Claim 領回 pUSD 餘額。")
 
 
 async def _bg_prefetch_cond_balance(live_exec: PolymarketLiveExecutor, token_id: str) -> None:
@@ -236,8 +352,18 @@ async def monitor_loop(
     max_daily_loss: float = 25.0,
     bet_pct: float = 0.0,
     max_daily_loss_pct: float = 0.0,
+    log_file: str = "",
 ) -> None:
     instance_lock = _acquire_single_instance_lock(db_path)
+    event_logger = _setup_event_logger("BTC", log_file)
+    is_tty = bool(sys.stdout.isatty())
+
+    def _emit(msg: str) -> None:
+        clean = str(msg).strip()
+        if event_logger is not None and clean:
+            event_logger.info(clean)
+        if is_tty or event_logger is None:
+            print(msg, flush=True)
     live_exec: Optional[PolymarketLiveExecutor] = None
     shared_risk: Optional[SharedDailyRiskGuard] = None
     eff_daily_loss = float(max_daily_loss)
@@ -321,8 +447,22 @@ async def monitor_loop(
     else:
         print(" 📱 Telegram 監控 : 未設定 TG_BOT_TOKEN (可隨時執行 python tg_bot.py 設定)")
     print("=" * 98)
+    _emit(f"[BOOT] Polymarket BTC 5m v4.5 | {mode_tag} | bankroll=${bankroll:,.2f}")
 
     feed_task = asyncio.create_task(hub.start())
+    loop_init = asyncio.get_running_loop()
+    init_clock_ms = await loop_init.run_in_executor(None, hub.chainlink.sync_clock_precise, hub._http)
+    if init_clock_ms is not None:
+        _emit(
+            f"[CLOCK] raw_offset_ms={hub.chainlink.raw_clock_offset_ms:+.1f}ms "
+            f"eff_offset_ms={hub.chainlink.effective_clock_offset_ms:+.1f}ms"
+        )
+        if abs(hub.chainlink.raw_clock_offset_ms) > 250.0 and tg.enabled and tg.get_recipient_ids():
+            tg.notify_alert(
+                "系統時鐘偏差警告",
+                f"本機時鐘偏差達 {hub.chainlink.raw_clock_offset_ms:+.1f}ms (>250ms)，已啟動毫秒補償，建議同步 OS NTP。",
+            )
+
     tg_task: Optional[asyncio.Task] = None
     if tg.enabled:
         tg_task = asyncio.create_task(tg.poll_loop(poll_commands=True, watch_db_changes=False))
@@ -346,6 +486,12 @@ async def monitor_loop(
     dyn_gap_bps: float = 0.0
     is_tg_paused: bool = False
     consecutive_loop_errors: int = 0
+    startup_reconciled: bool = live_exec is None
+    reconcile_in_flight: bool = False
+    monitor_start_ts: float = time.time()
+    last_seen_clock_sync_ts: float = hub.chainlink._precise_clock_synced_ts
+    last_clock_warn_ts: float = time.time() if abs(hub.chainlink.raw_clock_offset_ms) > 250.0 else 0.0
+    last_feed_warn_ts: dict[str, float] = {}
     bg_tasks: set[asyncio.Task] = set()
 
     try:
@@ -411,6 +557,16 @@ async def monitor_loop(
 
                 # Trigger non-blocking official Gamma + Chainlink settlement verification on rollover
                 if prev_window_ts is not None and window_ts != prev_window_ts:
+                    hs = hub.health.snapshot_dict(hub.chainlink)
+                    _emit(
+                        f"[HEALTH] window={prev_window_ts} | cl_src={cl.source} | "
+                        f"book_age_p50_ms={hs['book_age_p50_ms']} book_age_p99_ms={hs['book_age_p99_ms']} | "
+                        f"book_lag_p50_ms={hs['book_lag_p50_ms']} book_lag_p99_ms={hs['book_lag_p99_ms']} | "
+                        f"rollover_p99_ms={hs['rollover_p99_ms']} | "
+                        f"ws_book={hs['ws_book']} ws_pc={hs['ws_pc']} rest_fallbacks={hs['rest_fallbacks']} | "
+                        f"reconn(clob={hs['clob_reconn']},rtds={hs['rtds_reconn']},pb={hs['polybolt_reconn']},bn={hs['bn_reconn']},cb={hs['cb_reconn']}) | "
+                        f"stale_skips={hs['stale_skips']} | clock_raw_ms={hs['clock_raw_ms']:+.1f} clock_eff_ms={hs['clock_eff_ms']:+.1f}"
+                    )
                     t = asyncio.create_task(
                         resolve_official_polymarket_outcome(
                             hub=hub,
@@ -425,6 +581,7 @@ async def monitor_loop(
                             live_exec=live_exec,
                             tg=tg,
                             shared_risk=shared_risk,
+                            event_logger=event_logger,
                         )
                     )
                     bg_tasks.add(t)
@@ -436,6 +593,45 @@ async def monitor_loop(
                 prev_window_ts = window_ts
                 # Synchronously align 5m window state BEFORE reading strike_price (prevents stale strike leak!)
                 hub.sync_window_boundary(now)
+                if (
+                    not startup_reconciled
+                    and not reconcile_in_flight
+                    and live_exec is not None
+                    and st.up_token
+                    and st.down_token
+                ):
+                    reconcile_in_flight = True
+                    try:
+                        rec_id = await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            reconcile_startup_position,
+                            window_ts,
+                            elapsed,
+                            st.up_token,
+                            st.down_token,
+                            live_exec,
+                            storage,
+                            strategy,
+                            cfg,
+                            now,
+                            st.book.up_ask,
+                            st.book.down_ask,
+                        )
+                        if rec_id is not None and strategy.active_position is not None:
+                            active_db_trade_id = rec_id
+                            rp = strategy.active_position
+                            _emit(
+                                f"🔄 [RECONCILED_POSITION // STARTUP] window={rp.window_ts} {rp.side} "
+                                f"shares={rp.shares:.2f} @ ${rp.entry_price:.3f}"
+                            )
+                            if tg.enabled and tg.get_recipient_ids():
+                                tg.notify_alert(
+                                    "重啟對帳接管部位",
+                                    f"已接管 {rp.side} {rp.shares:.2f} sh @ ${rp.entry_price:.3f} (window={rp.window_ts})",
+                                )
+                    finally:
+                        reconcile_in_flight = False
+                        startup_reconciled = True
                 if st.strike_price is not None:
                     prev_strike = st.strike_price
                 if st.book.up_bid is not None:
@@ -507,6 +703,52 @@ async def monitor_loop(
                     )
 
                 if is_1hz_tick:
+                    if hub.chainlink._precise_clock_synced_ts > last_seen_clock_sync_ts:
+                        last_seen_clock_sync_ts = hub.chainlink._precise_clock_synced_ts
+                        _emit(
+                            f"[CLOCK] raw_offset_ms={hub.chainlink.raw_clock_offset_ms:+.1f}ms "
+                            f"eff_offset_ms={hub.chainlink.effective_clock_offset_ms:+.1f}ms"
+                        )
+                        if (
+                            abs(hub.chainlink.raw_clock_offset_ms) > 250.0
+                            and (time.time() - last_clock_warn_ts) >= 3600.0
+                        ):
+                            last_clock_warn_ts = time.time()
+                            _emit(f"[CLOCK WARN] raw_offset_ms={hub.chainlink.raw_clock_offset_ms:+.1f}ms > 250ms")
+                            if tg.enabled and tg.get_recipient_ids():
+                                tg.notify_alert(
+                                    "系統時鐘偏差警告",
+                                    f"本機時鐘偏差 {hub.chainlink.raw_clock_offset_ms:+.1f}ms (>250ms)",
+                                )
+
+                    if 150.0 <= elapsed <= 255.0 and st.last_book_update_local_ts > 0.0:
+                        hub.health.record_hot_sample(
+                            age_ms=(time.time() - st.last_book_update_local_ts) * 1000.0,
+                            lag_ms=st.last_book_lag_sec * 1000.0,
+                        )
+
+                    if (time.time() - monitor_start_ts) >= 30.0:
+                        now_wall = time.time()
+                        feed_silences = (
+                            ("chainlink", now_wall - cl.local_recv_ts if cl.local_recv_ts > 0 else 999.0),
+                            (
+                                "clob",
+                                (now_wall - st.last_book_update_local_ts)
+                                if (st.up_token and st.last_book_update_local_ts > 0)
+                                else (999.0 if st.up_token else 0.0),
+                            ),
+                            ("binance", now_wall - st.binance_ts if st.binance_ts > 0 else 999.0),
+                        )
+                        for f_name, f_sil in feed_silences:
+                            if f_sil > 10.0 and (now_wall - last_feed_warn_ts.get(f_name, 0.0)) >= 900.0:
+                                last_feed_warn_ts[f_name] = now_wall
+                                _emit(f"[FEED WARN] {f_name} silent={f_sil:.1f}s (>10s)")
+                                if tg.enabled and tg.get_recipient_ids():
+                                    tg.notify_alert(
+                                        "資料源斷線超過 10 秒",
+                                        f"{f_name} 已靜默 {f_sil:.1f} 秒 (>10s)，請檢查網路或 VPN。",
+                                    )
+
                     storage.record_snapshot(
                         ts=now,
                         window_ts=window_ts,
@@ -547,20 +789,21 @@ async def monitor_loop(
                                 continue
 
                             p = strategy.active_position
+                            side_book_ts = st.up_book_local_ts if p.side == "UP" else st.down_book_local_ts
+                            ref_book_ts = side_book_ts or st.last_book_update_local_ts
+                            book_age = (time.time() - ref_book_ts) if ref_book_ts > 0.0 else 999.0
+                            book_lag = st.up_book_lag_sec if p.side == "UP" else st.down_book_lag_sec
                             live_order_id = ""
                             if live_exec is not None:
                                 abort_live_entry = False
-                                cl_age = time.time() - cl.local_recv_ts
-                                book_age = (
-                                    (time.time() - st.last_book_update_local_ts)
-                                    if st.last_book_update_local_ts > 0.0
-                                    else 999.0
-                                )
-                                if cl.source not in ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK", "POLY_RTDS_CHAINLINK") or cl_age > 4.5:
+                                if not startup_reconciled:
                                     abort_live_entry = True
-                                elif book_age > 5.0:
-                                    print(
-                                        f"\n⚠️ [LIVE 盤口過舊攔截] book_age={book_age:.1f}s > 5.0s，跳過進場。"
+                                elif not cl.is_alive(max_silence_sec=4.5):
+                                    abort_live_entry = True
+                                elif book_age > 1.5 or book_lag > 1.0:
+                                    hub.health.stale_book_skips += 1
+                                    _emit(
+                                        f"⚠️ [LIVE 盤口過舊攔截] book_age={book_age:.2f}s book_lag={book_lag:.2f}s (門檻 1.5s/1.0s)，跳過進場。"
                                     )
                                     abort_live_entry = True
                                 elif (now - last_live_attempt_ts) < 5.0:
@@ -635,7 +878,7 @@ async def monitor_loop(
 
                                         fill = await asyncio.get_running_loop().run_in_executor(None, _locked_live_entry)
                                         if not fill.filled or fill.filled_shares <= 0.0:
-                                            print(f"\n⚠️ [LIVE FAK 未成交] {fill.error or '流動性不足'}，已自動取消不追價。")
+                                            _emit(f"⚠️ [LIVE FAK 未成交] {fill.error or '流動性不足'}，已自動取消不追價。")
                                             abort_live_entry = True
                                         else:
                                             live_order_id = fill.order_id
@@ -651,11 +894,21 @@ async def monitor_loop(
                                             )
                                             bg_tasks.add(pf_task)
                                             pf_task.add_done_callback(bg_tasks.discard)
-                                            print(
-                                                f"\n🔴 [LIVE 實盤成交] order={fill.order_id[:12]} | "
+                                            _emit(
+                                                f"🔴 [LIVE 實盤成交] order={fill.order_id[:19]} | "
                                                 f"shares={p.shares:.2f} @ ${p.entry_price:.3f} (含費成本 ${p.total_cost_per_share:.4f}) | "
-                                                f"耗時 {fill.latency_ms:.0f}ms"
+                                                f"耗時 {fill.latency_ms:.0f}ms | book_age={book_age*1000:.0f}ms book_lag={book_lag*1000:.0f}ms"
                                             )
+                                            if fill.order_id == "RECONCILED_POSITION":
+                                                _emit(
+                                                    f"🔄 [RECONCILED_POSITION] window={p.window_ts} {p.side} "
+                                                    f"shares={p.shares:.2f} @ ${p.entry_price:.3f} ({fill.error or 'timeout'})"
+                                                )
+                                                if tg.enabled and tg.get_recipient_ids():
+                                                    tg.notify_alert(
+                                                        "逾時對帳接管部位",
+                                                        f"{p.side} {p.shares:.2f} sh @ ${p.entry_price:.3f} ({fill.error or 'timeout'})",
+                                                    )
                                 if abort_live_entry:
                                     strategy.active_position = None
                                     strategy.traded_windows.discard(window_ts)
@@ -663,7 +916,7 @@ async def monitor_loop(
                                     await asyncio.sleep(loop_sleep)
                                     continue
 
-                            print(f"\n*** {action} ***")
+                            _emit(f"*** {action} | book_age={book_age*1000:.0f}ms book_lag={book_lag*1000:.0f}ms ***")
                             active_db_trade_id = storage.insert_paper_trade(
                                 window_ts=p.window_ts,
                                 side=p.side,
@@ -712,7 +965,7 @@ async def monitor_loop(
                                 rem_est_pnl = last.net_pnl_usdc - prior_partial
                                 if exit_fill is None or not exit_fill.filled or exit_fill.filled_shares <= 0.0:
                                     err_msg = exit_fill.error if exit_fill else "無可用買盤"
-                                    print(f"\n⚠️ [LIVE 平倉未成交] {err_msg}，保留真實持倉繼續盯盤！")
+                                    _emit(f"⚠️ [LIVE 平倉未成交] {err_msg}，保留真實持倉繼續盯盤！")
                                     strategy.closed_trades.pop()
                                     strategy.bankroll -= rem_est_pnl
                                     strategy.active_position = prev_pos
@@ -727,8 +980,8 @@ async def monitor_loop(
                                         fee_rate=cfg.crypto_taker_fee_rate,
                                     )
                                     part_pnl = exit_fill.filled_shares * (part_payout - prev_pos.total_cost_per_share)
-                                    print(
-                                        f"\n🔴 [LIVE 部分平倉] filled={exit_fill.filled_shares:.2f}/{prev_pos.shares:.2f} "
+                                    _emit(
+                                        f"🔴 [LIVE 部分平倉] filled={exit_fill.filled_shares:.2f}/{prev_pos.shares:.2f} "
                                         f"@ ${part_px:.3f} (已實現={part_pnl:+.2f} pUSD)，剩餘部位繼續盯盤！"
                                     )
                                     strategy.closed_trades.pop()
@@ -758,8 +1011,8 @@ async def monitor_loop(
                                     last.net_pnl_usdc = prior_partial + final_leg_pnl
                                     last.won = last.net_pnl_usdc > 0
                                     strategy.bankroll += (last.net_pnl_usdc - old_pnl)
-                                print(
-                                    f"\n🔴 [LIVE 實盤平倉] {last.exit_reason} | filled={exit_fill.filled_shares:.2f} "
+                                _emit(
+                                    f"🔴 [LIVE 實盤平倉] {last.exit_reason} | filled={exit_fill.filled_shares:.2f} "
                                     f"@ ${exit_fill.avg_price:.3f} | 實得淨損益={last.net_pnl_usdc:+.2f} pUSD | "
                                     f"耗時 {exit_fill.latency_ms:.0f}ms"
                                 )
@@ -771,12 +1024,12 @@ async def monitor_loop(
                                     live_exec.circuit_broken = bool(r_state["circuit_broken"])
                                 last_bal_sync_ts = 0.0
                                 if live_exec.circuit_broken:
-                                    print(
-                                        f"\n🛑 [風控熔斷] 今日實盤累計虧損已達上限 "
+                                    _emit(
+                                        f"🛑 [風控熔斷] 今日實盤累計虧損已達上限 "
                                         f"(-${live_exec.max_daily_loss_usdc:.1f})，已自動停止新開倉！"
                                     )
 
-                            print(f"\n*** {action} ***")
+                            _emit(f"*** {action} ***")
                             storage.close_paper_trade(
                                 active_db_trade_id,
                                 now,
@@ -835,13 +1088,14 @@ async def monitor_loop(
                             if (cfg.entry_start_elapsed_sec <= elapsed <= cfg.entry_end_elapsed_sec)
                             else "WAIT "
                         )
-                        line = (
-                            f"[{zone_tag} 剩{int(remaining):3d}s] CL={cl_spot:,.2f} "
-                            f"(差={diff:+6.1f} | Gap={fv.oracle_gap_bps:+5.1f}bp | Z={fv.raw_z_score:+5.2f}) | "
-                            f"P(Up)={fv.p_true_up*100:5.1f}% | Ask={up_ask_str}/{dn_ask_str} | Edge={edge_str}"
-                        )
-                        print("\r" + _fit_console_line(line), end="", flush=True)
-                elif is_1hz_tick:
+                        if is_tty:
+                            line = (
+                                f"[{zone_tag} 剩{int(remaining):3d}s] CL={cl_spot:,.2f} "
+                                f"(差={diff:+6.1f} | Gap={fv.oracle_gap_bps:+5.1f}bp | Z={fv.raw_z_score:+5.2f}) | "
+                                f"P(Up)={fv.p_true_up*100:5.1f}% | Ask={up_ask_str}/{dn_ask_str} | Edge={edge_str}"
+                            )
+                            print("\r" + _fit_console_line(line), end="", flush=True)
+                elif is_1hz_tick and is_tty:
                     cl_str = f"${cl_spot:,.2f}" if cl_spot else "斷線重連中..."
                     cex_str = f"${cex_lead:,.2f}" if cex_lead else "連線中..."
                     line = f"[等待整點鎖定 Strike | 剩 {int(remaining):3d}s 開新盤] Chainlink={cl_str} ({cl.source}) | CEX={cex_str}"
@@ -853,7 +1107,10 @@ async def monitor_loop(
                 raise
             except Exception as exc:
                 consecutive_loop_errors += 1
-                sys.stderr.write(f"\n[MONITOR LOOP WARN] {type(exc).__name__}: {exc}\n")
+                err_line = f"[MONITOR LOOP WARN] {type(exc).__name__}: {exc}"
+                if event_logger is not None:
+                    event_logger.warning(err_line)
+                sys.stderr.write(f"\n{err_line}\n")
                 await asyncio.sleep(min(5.0, 1.0 * consecutive_loop_errors))
     except KeyboardInterrupt:
         print("\n已安全停止模擬盤監控。")
@@ -864,6 +1121,10 @@ async def monitor_loop(
         if tg_task is not None:
             tg_task.cancel()
         storage.close()
+        if event_logger is not None:
+            for h in list(event_logger.handlers):
+                event_logger.removeHandler(h)
+                h.close()
         try:
             instance_lock.close()
         except Exception:
@@ -879,6 +1140,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-daily-loss", type=float, default=50.0, help="實盤單日最大虧損熔斷金額 (pUSD)")
     parser.add_argument("--bet-pct", type=float, default=0.0, help="按即時權益等比下注比例 (例: 0.10 = 10%，優先於 --bet)")
     parser.add_argument("--max-daily-loss-pct", type=float, default=0.0, help="三幣共用單日最大虧損比例熔斷 (例: 0.30 = 30%)")
+    parser.add_argument("--log-file", default="", help="結構化日誌檔路徑 (50MB 輪替保留 5 份；非終端機停止 \\r 狀態輸出)")
     args = parser.parse_args()
     asyncio.run(
         monitor_loop(
@@ -889,5 +1151,6 @@ if __name__ == "__main__":
             max_daily_loss=args.max_daily_loss,
             bet_pct=args.bet_pct,
             max_daily_loss_pct=args.max_daily_loss_pct,
+            log_file=args.log_file,
         )
     )

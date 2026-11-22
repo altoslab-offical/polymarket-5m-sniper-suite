@@ -25,6 +25,17 @@ TG_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
 _FILL_RE = re.compile(r"LIVE 實盤成交.*?\$\s*([0-9]+(?:\.[0-9]+)?)")
 _ENTRY_ASK_RE = re.compile(r"\[ENTRY\s+(?:UP|DOWN)\].*?ask=\$([0-9]+(?:\.[0-9]+)?)")
 _CHAINLINK_SRC_RE = re.compile(r"\(([A-Z0-9_]*CHAINLINK[A-Z0-9_]*)\)")
+_BOOK_FRESH_RE = re.compile(r"book_age=([0-9]+(?:\.[0-9]+)?)ms\s+book_lag=([0-9]+(?:\.[0-9]+)?)ms")
+_CLOCK_RE = re.compile(r"raw_offset_ms=([+-]?[0-9]+(?:\.[0-9]+)?)ms\s+eff_offset_ms=([+-]?[0-9]+(?:\.[0-9]+)?)ms")
+_HEALTH_RE = re.compile(
+    r"\[HEALTH\].*?cl_src=(\S+).*?"
+    r"book_age_p50_ms=(\S+)\s+book_age_p99_ms=(\S+).*?"
+    r"book_lag_p50_ms=(\S+)\s+book_lag_p99_ms=(\S+).*?"
+    r"rollover_p99_ms=(\S+).*?"
+    r"ws_book=(\d+)\s+ws_pc=(\d+)\s+rest_fallbacks=(\d+).*?"
+    r"reconn\(([^)]*)\).*?stale_skips=(\d+).*?"
+    r"clock_raw_ms=([+-]?[0-9]+(?:\.[0-9]+)?)\s+clock_eff_ms=([+-]?[0-9]+(?:\.[0-9]+)?)"
+)
 
 
 @dataclass(frozen=True)
@@ -109,6 +120,79 @@ def parse_execution_slippage(log_text: str) -> dict[str, Any]:
     }
 
 
+def _opt_float(token: str) -> float | None:
+    if not token or token == "None":
+        return None
+    try:
+        return float(token)
+    except ValueError:
+        return None
+
+
+def _empty_health_metrics() -> dict[str, Any]:
+    return {
+        "book_age_p50_ms": None,
+        "book_age_p99_ms": None,
+        "book_lag_p50_ms": None,
+        "book_lag_p99_ms": None,
+        "rollover_p99_ms": None,
+        "ws_book": 0,
+        "ws_pc": 0,
+        "rest_fallbacks": 0,
+        "reconn_total": 0,
+        "stale_skips": 0,
+        "clock_raw_ms": None,
+        "clock_eff_ms": None,
+        "enter_fresh_cnt": 0,
+        "stale_enter_cnt": 0,
+        "reconciled_cnt": 0,
+        "feed_warn_cnt": 0,
+        "cl_src_health": None,
+    }
+
+
+def _parse_health_metrics(lines: list[str]) -> dict[str, Any]:
+    """Extract v4.5 health percentiles, reconnect totals, clock offsets, and stale ENTER violations."""
+    m_data = _empty_health_metrics()
+    for ln in lines:
+        if "RECONCILED_POSITION" in ln:
+            m_data["reconciled_cnt"] += 1
+        if "[FEED WARN]" in ln:
+            m_data["feed_warn_cnt"] += 1
+        if "LIVE 實盤成交" in ln or "[ENTRY " in ln:
+            mf = _BOOK_FRESH_RE.search(ln)
+            if mf:
+                age_ms, lag_ms = float(mf.group(1)), float(mf.group(2))
+                m_data["enter_fresh_cnt"] += 1
+                if age_ms > 1500.0 or lag_ms > 1000.0:
+                    m_data["stale_enter_cnt"] += 1
+        mc = _CLOCK_RE.search(ln)
+        if mc:
+            m_data["clock_raw_ms"] = float(mc.group(1))
+            m_data["clock_eff_ms"] = float(mc.group(2))
+        mh = _HEALTH_RE.search(ln)
+        if mh:
+            reconn_pairs = [p.split("=") for p in mh.group(10).split(",") if "=" in p]
+            m_data.update(
+                {
+                    "cl_src_health": mh.group(1),
+                    "book_age_p50_ms": _opt_float(mh.group(2)),
+                    "book_age_p99_ms": _opt_float(mh.group(3)),
+                    "book_lag_p50_ms": _opt_float(mh.group(4)),
+                    "book_lag_p99_ms": _opt_float(mh.group(5)),
+                    "rollover_p99_ms": _opt_float(mh.group(6)),
+                    "ws_book": int(mh.group(7)),
+                    "ws_pc": int(mh.group(8)),
+                    "rest_fallbacks": int(mh.group(9)),
+                    "reconn_total": sum(int(kv[1]) for kv in reconn_pairs if kv[1].isdigit()),
+                    "stale_skips": int(mh.group(11)),
+                    "clock_raw_ms": float(mh.group(12)),
+                    "clock_eff_ms": float(mh.group(13)),
+                }
+            )
+    return m_data
+
+
 def _audit_single_log(log_path: Path, lock_pid: int | None, active_pids: set[int]) -> dict[str, Any]:
     daemon_alive = bool(lock_pid is not None and lock_pid in active_pids)
     if not log_path.exists():
@@ -121,12 +205,17 @@ def _audit_single_log(log_path: Path, lock_pid: int | None, active_pids: set[int
             "exit_miss_cnt": 0,
             "risk_block_cnt": 0,
             "latest_chainlink_src": None,
+            "log_size_mb": 0.0,
+            "health": _empty_health_metrics(),
             "slippage": {"fills_matched": 0, "mean_slippage_cents": None, "max_slippage_cents": None},
         }
     text = log_path.read_text(encoding="utf-8", errors="replace").replace("\r", "\n")
     lines = text.splitlines()
     lower_lines = [ln.lower() for ln in lines]
     cl_sources = _CHAINLINK_SRC_RE.findall(text)
+    health = _parse_health_metrics(lines)
+    latest_src = health["cl_src_health"] or (cl_sources[-1] if cl_sources else None)
+    size_mb = round(log_path.stat().st_size / (1024.0 * 1024.0), 2)
     return {
         "daemon_alive": daemon_alive,
         "pid": lock_pid,
@@ -135,7 +224,9 @@ def _audit_single_log(log_path: Path, lock_pid: int | None, active_pids: set[int
         "fak_miss_cnt": sum(1 for ln in lines if "LIVE FAK 未成交" in ln),
         "exit_miss_cnt": sum(1 for ln in lines if "LIVE 平倉未成交" in ln),
         "risk_block_cnt": sum(1 for ln in lines if "LIVE 熔斷攔截" in ln),
-        "latest_chainlink_src": cl_sources[-1] if cl_sources else None,
+        "latest_chainlink_src": latest_src,
+        "log_size_mb": size_mb,
+        "health": health,
         "slippage": parse_execution_slippage(text),
     }
 
@@ -235,6 +326,11 @@ def _build_optimization_watchlist(
         if log_st["exit_miss_cnt"] > 0:
             notes.append(
                 f"[EXEC] {coin.upper()} 出現 {log_st['exit_miss_cnt']} 次平倉未成交，可檢查止損/止盈滑價容許幅。"
+            )
+        h_st = log_st.get("health") or {}
+        if int(h_st.get("stale_enter_cnt") or 0) > 0:
+            notes.append(
+                f"[STALE] {coin.upper()} 偵測到 {h_st['stale_enter_cnt']} 次超標盤口 ENTER（>1.5s/1.0s），需立即複查。"
             )
     if wallet_geo.get("geo_blocked") is True:
         notes.append("[NET] Polymarket Geoblock 回報受限，請立即檢查 VPN 節點。")
@@ -364,6 +460,35 @@ def run_daily_review(
     }
 
 
+def _fmt_ms(val: float | None) -> str:
+    return f"{val:.1f}ms" if val is not None else "--"
+
+
+def _render_health_table_lines(report: dict[str, Any]) -> list[str]:
+    """Render P0/P1 connection freshness, clock skew, and log size metrics per coin."""
+    lines = [
+        "## 3. 資料源品質、盤口新鮮度與時鐘健康表",
+        "| 幣種 | book_age P50/P99 | book_lag P50/P99 | 換窗首單 P99 | REST 補抓 | 重連次數 | 時鐘殘差(原始) | 舊盤ENTER/對帳 | 日誌(MB) |",
+        "|---|---|---|---|---:|---:|---|---|---:|",
+    ]
+    for coin in COINS:
+        clg = report["per_coin_logs"][coin]
+        h = clg.get("health") or _empty_health_metrics()
+        age_s = f"{_fmt_ms(h.get('book_age_p50_ms'))}/{_fmt_ms(h.get('book_age_p99_ms'))}"
+        lag_s = f"{_fmt_ms(h.get('book_lag_p50_ms'))}/{_fmt_ms(h.get('book_lag_p99_ms'))}"
+        clk_s = (
+            f"{h['clock_eff_ms']:+.1f} ({h['clock_raw_ms']:+.1f}ms)"
+            if h.get("clock_eff_ms") is not None and h.get("clock_raw_ms") is not None
+            else "--"
+        )
+        lines.append(
+            f"| **{coin.upper()}** | `{age_s}` | `{lag_s}` | `{_fmt_ms(h.get('rollover_p99_ms'))}` | "
+            f"{h.get('rest_fallbacks', 0)} | {h.get('reconn_total', 0)} | `{clk_s}` | "
+            f"`{h.get('stale_enter_cnt', 0)}/{h.get('reconciled_cnt', 0)}` | {clg.get('log_size_mb', 0.0):.2f} |"
+        )
+    return lines
+
+
 def render_markdown_report(report: dict[str, Any]) -> str:
     """Format daily audit dictionary into a clean Traditional Chinese Markdown report."""
     tot = report["total_all"]
@@ -405,7 +530,8 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             f"`{c_slip_s}` | `{err_s}` | `{clg['latest_chainlink_src'] or '--'}` |"
         )
 
-    lines.extend(["", "## 3. 進場時段、Z 值分桶與執行滑價"])
+    lines.extend(["", *_render_health_table_lines(report)])
+    lines.extend(["", "## 4. 進場時段、Z 值分桶與執行滑價"])
     lines.append(f"- **成交品質**：已配對 `{slip['fills_matched']}` 筆｜未成交 `{slip['fak_misses']}` 次｜成交率 `{fill_r}`｜平均滑價 `{mean_slip}`")
     for title, group in (("進場秒數分桶", report["elapsed_buckets"]), ("Z 值強度分桶", report["z_buckets"])):
         parts = []
@@ -414,7 +540,7 @@ def render_markdown_report(report: dict[str, Any]) -> str:
             parts.append(f"`{b_name}`: `{b_st['wins']}W-{b_st['losses']}L` ({b_wr}, `{b_st['net_pnl_usdc']:+.2f}`)")
         lines.append(f"- **{title}**：" + " ｜ ".join(parts))
 
-    lines.extend(["", "## 4. 漸進微調觀察清單（維持原技術基底、不爆改）"])
+    lines.extend(["", "## 5. 漸進微調觀察清單（維持原技術基底、不爆改）"])
     for item in report["watchlist"]:
         lines.append(f"- {item}")
     return "\n".join(lines) + "\n"

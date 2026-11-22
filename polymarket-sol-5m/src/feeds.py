@@ -8,13 +8,14 @@ Real-time Asynchronous Market Data Hub:
    AND official Gamma `outcomePrices` settlement verification!
 """
 import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 from email.utils import parsedate_to_datetime
 import json
 import math
 from statistics import NormalDist
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import requests
 
@@ -46,27 +47,31 @@ def parse_json_or_list(val: Any) -> list:
     return []
 
 
+def _levels_to_map(levels: Any) -> Dict[float, float]:
+    """Convert CLOB REST/WS level list into {rounded_price: size} keeping valid prices inside (0, 1)."""
+    out: Dict[float, float] = {}
+    for lvl in levels or ():
+        if not isinstance(lvl, dict):
+            continue
+        try:
+            px = round(float(lvl.get("price") or 0.0), 4)
+            sz = float(lvl.get("size") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if 0.0 < px < 1.0 and sz > 0.0:
+            out[px] = sz
+    return out
+
+
 def extract_best_bid_ask(book_payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     """
     Safely compute best bid (highest bid price) and best ask (lowest ask price)
     regardless of how Polymarket CLOB sorts the arrays.
     """
-    bids = book_payload.get("bids") or []
-    asks = book_payload.get("asks") or []
-
-    valid_bids = [
-        float(b["price"])
-        for b in bids
-        if float(b.get("size", 0)) > 0 and 0.0 < float(b.get("price", 0)) < 1.0
-    ]
-    valid_asks = [
-        float(a["price"])
-        for a in asks
-        if float(a.get("size", 0)) > 0 and 0.0 < float(a.get("price", 0)) < 1.0
-    ]
-
-    best_bid = max(valid_bids) if valid_bids else None
-    best_ask = min(valid_asks) if valid_asks else None
+    bids_map = _levels_to_map(book_payload.get("bids"))
+    asks_map = _levels_to_map(book_payload.get("asks"))
+    best_bid = max(bids_map) if bids_map else None
+    best_ask = min(asks_map) if asks_map else None
     return best_bid, best_ask
 
 
@@ -99,37 +104,21 @@ def _sweep_vwap(levels: List[Tuple[float, float]], target_shares: float, max_sli
     return round(cost / filled, 4)
 
 
-def extract_executable_bid_ask(
-    book_payload: Dict[str, Any],
+def extract_executable_bid_ask_from_maps(
+    bids_map: Dict[float, float],
+    asks_map: Dict[float, float],
     target_usdc: float = 25.0,
 ) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Depth-aware VWAP Bid/Ask for a `target_usdc` order (~30-35 shares), preventing paper-trading
-    illusions from 0.5-share dust orders sitting at the top of the CLOB!
-    """
+    """Compute depth-aware VWAP Bid/Ask directly from live L2 price->size dictionaries."""
     if target_usdc <= 0:
-        return extract_best_bid_ask(book_payload)
+        best_bid = max(bids_map) if bids_map else None
+        best_ask = min(asks_map) if asks_map else None
+        if best_bid is not None and best_ask is not None and best_bid >= best_ask:
+            return None, None
+        return best_bid, best_ask
 
-    bids_raw = book_payload.get("bids") or []
-    asks_raw = book_payload.get("asks") or []
-
-    bids = sorted(
-        [
-            (float(b["price"]), float(b["size"]))
-            for b in bids_raw
-            if float(b.get("size", 0)) > 0 and 0.0 < float(b.get("price", 0)) < 1.0
-        ],
-        key=lambda x: x[0],
-        reverse=True,
-    )
-    asks = sorted(
-        [
-            (float(a["price"]), float(a["size"]))
-            for a in asks_raw
-            if float(a.get("size", 0)) > 0 and 0.0 < float(a.get("price", 0)) < 1.0
-        ],
-        key=lambda x: x[0],
-    )
+    bids = sorted(((p, sz) for p, sz in bids_map.items() if sz > 0.0 and 0.0 < p < 1.0), key=lambda x: x[0], reverse=True)
+    asks = sorted(((p, sz) for p, sz in asks_map.items() if sz > 0.0 and 0.0 < p < 1.0), key=lambda x: x[0])
 
     vwap_ask = None
     if asks:
@@ -144,6 +133,19 @@ def extract_executable_bid_ask(
     if vwap_bid is not None and vwap_ask is not None and vwap_bid >= vwap_ask:
         return None, None
     return vwap_bid, vwap_ask
+
+
+def extract_executable_bid_ask(
+    book_payload: Dict[str, Any],
+    target_usdc: float = 25.0,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Depth-aware VWAP Bid/Ask for a `target_usdc` order (~30-35 shares), preventing paper-trading
+    illusions from 0.5-share dust orders sitting at the top of the CLOB!
+    """
+    bids_map = _levels_to_map(book_payload.get("bids"))
+    asks_map = _levels_to_map(book_payload.get("asks"))
+    return extract_executable_bid_ask_from_maps(bids_map, asks_map, target_usdc=target_usdc)
 
 
 def fetch_5m_market_metadata(
@@ -246,12 +248,11 @@ def _parse_book_ts_sec(payload: Dict[str, Any]) -> float:
         return 0.0
 
 
-def fetch_clob_book_top(
+def fetch_clob_book_raw(
     token_id: str,
     session: Optional[requests.Session] = None,
     timeout: float = 2.5,
-    target_usdc: float = 25.0,
-) -> Tuple[Optional[float], Optional[float], float]:
+) -> Optional[Dict[str, Any]]:
     http = session or requests
     try:
         resp = http.get(
@@ -261,12 +262,72 @@ def fetch_clob_book_top(
             timeout=timeout,
         )
         if resp.status_code != 200:
-            return None, None, 0.0
+            return None
         data = resp.json()
-        bid, ask = extract_executable_bid_ask(data, target_usdc=target_usdc)
-        return bid, ask, _parse_book_ts_sec(data)
+        return data if isinstance(data, dict) else None
     except Exception:
+        return None
+
+
+def fetch_clob_book_top(
+    token_id: str,
+    session: Optional[requests.Session] = None,
+    timeout: float = 2.5,
+    target_usdc: float = 25.0,
+) -> Tuple[Optional[float], Optional[float], float]:
+    data = fetch_clob_book_raw(token_id, session=session, timeout=timeout)
+    if data is None:
         return None, None, 0.0
+    bid, ask = extract_executable_bid_ask(data, target_usdc=target_usdc)
+    return bid, ask, _parse_book_ts_sec(data)
+
+
+@dataclass
+class FeedHealthStats:
+    """Rolling latency percentiles and reconnect counters for real-time observability."""
+
+    clob_ws_book_msgs: int = 0
+    clob_ws_price_change_msgs: int = 0
+    clob_rest_fallbacks: int = 0
+    clob_ws_reconnects: int = 0
+    binance_ws_reconnects: int = 0
+    coinbase_ws_reconnects: int = 0
+    stale_book_skips: int = 0
+    hot_book_age_ms: Deque[float] = field(default_factory=lambda: deque(maxlen=2000))
+    hot_book_lag_ms: Deque[float] = field(default_factory=lambda: deque(maxlen=2000))
+    rollover_first_book_ms: Deque[float] = field(default_factory=lambda: deque(maxlen=100))
+
+    @staticmethod
+    def percentile(values: Deque[float], q: float) -> Optional[float]:
+        if not values:
+            return None
+        ordered = sorted(values)
+        idx = int(round((len(ordered) - 1) * max(0.0, min(1.0, q))))
+        return round(float(ordered[idx]), 1)
+
+    def record_hot_sample(self, age_ms: float, lag_ms: float) -> None:
+        self.hot_book_age_ms.append(max(0.0, float(age_ms)))
+        self.hot_book_lag_ms.append(max(0.0, float(lag_ms)))
+
+    def snapshot_dict(self, chainlink: Any) -> Dict[str, Any]:
+        return {
+            "ws_book": self.clob_ws_book_msgs,
+            "ws_pc": self.clob_ws_price_change_msgs,
+            "rest_fallbacks": self.clob_rest_fallbacks,
+            "clob_reconn": self.clob_ws_reconnects,
+            "rtds_reconn": int(getattr(chainlink, "rtds_reconnects", 0)),
+            "polybolt_reconn": int(getattr(chainlink, "polybolt_reconnects", 0)),
+            "bn_reconn": self.binance_ws_reconnects,
+            "cb_reconn": self.coinbase_ws_reconnects,
+            "stale_skips": self.stale_book_skips,
+            "book_age_p50_ms": self.percentile(self.hot_book_age_ms, 0.50),
+            "book_age_p99_ms": self.percentile(self.hot_book_age_ms, 0.99),
+            "book_lag_p50_ms": self.percentile(self.hot_book_lag_ms, 0.50),
+            "book_lag_p99_ms": self.percentile(self.hot_book_lag_ms, 0.99),
+            "rollover_p99_ms": self.percentile(self.rollover_first_book_ms, 0.99),
+            "clock_raw_ms": float(getattr(chainlink, "raw_clock_offset_ms", 0.0)),
+            "clock_eff_ms": float(getattr(chainlink, "effective_clock_offset_ms", 0.0)),
+        }
 
 
 @dataclass
@@ -290,8 +351,21 @@ class LiveFeedState:
     book: OrderBookTop = None  # type: ignore
     up_book_ts: float = 0.0
     down_book_ts: float = 0.0
+    up_book_local_ts: float = 0.0
+    down_book_local_ts: float = 0.0
+    up_book_lag_sec: float = 0.0
+    down_book_lag_sec: float = 0.0
+    last_book_lag_sec: float = 0.0
     last_ws_book_local_ts: float = 0.0
     last_book_update_local_ts: float = 0.0
+    _up_bids: Dict[float, float] = field(default_factory=dict)
+    _up_asks: Dict[float, float] = field(default_factory=dict)
+    _down_bids: Dict[float, float] = field(default_factory=dict)
+    _down_asks: Dict[float, float] = field(default_factory=dict)
+    _up_book_initialized: bool = False
+    _down_book_initialized: bool = False
+    _window_is_rollover: bool = False
+    _window_first_book_recorded: bool = False
 
     def __post_init__(self) -> None:
         if self.book is None:
@@ -383,11 +457,12 @@ class LiveMarketHub:
         self.target_usdc = max(5.0, target_usdc) if target_usdc > 0 else 25.0
         self.chainlink = ChainlinkOracleFeed()
         self.state = LiveFeedState()
+        self.health = FeedHealthStats()
         self._stop_event = asyncio.Event()
         self._http = requests.Session()
         self._http.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+                "User-Agent": "polymarket-5m-sniper/4.5",
                 "Accept": "application/json",
             }
         )
@@ -426,13 +501,27 @@ class LiveMarketHub:
                     self.state.strike_source = self.chainlink.state.source
             return
 
+        had_prev = self.state.current_window_ts > 0
         self.state.current_window_ts = window_ts
         self.state.slug = f"sol-updown-5m-{window_ts}"
         self.state.book = OrderBookTop()
         self.state.up_book_ts = 0.0
         self.state.down_book_ts = 0.0
+        self.state.up_book_local_ts = 0.0
+        self.state.down_book_local_ts = 0.0
+        self.state.up_book_lag_sec = 0.0
+        self.state.down_book_lag_sec = 0.0
+        self.state.last_book_lag_sec = 0.0
         self.state.last_ws_book_local_ts = 0.0
         self.state.last_book_update_local_ts = 0.0
+        self.state._up_bids.clear()
+        self.state._up_asks.clear()
+        self.state._down_bids.clear()
+        self.state._down_asks.clear()
+        self.state._up_book_initialized = False
+        self.state._down_book_initialized = False
+        self.state._window_is_rollover = had_prev
+        self.state._window_first_book_recorded = False
         self.state._implied_strike_samples.clear()
         self._gamma_strike_checks = 0
 
@@ -473,11 +562,162 @@ class LiveMarketHub:
         self._stop_event.set()
         self.chainlink.stop()
 
+    def _record_book_side(
+        self,
+        side: str,
+        bid: Optional[float],
+        ask: Optional[float],
+        ev_ts: float,
+        now_u: float,
+        via_ws: bool,
+    ) -> None:
+        local_ts = time.time()
+        lag_sec = max(0.0, now_u - ev_ts) if ev_ts > 0.0 else 0.0
+        if side == "UP":
+            self.state.book.up_bid, self.state.book.up_ask = bid, ask
+            if ev_ts > self.state.up_book_ts:
+                self.state.up_book_ts = ev_ts
+            self.state.up_book_local_ts = local_ts
+            self.state.up_book_lag_sec = lag_sec
+            if via_ws and bid is not None and bid >= 0.92 and (self.state.book.down_bid or 0.0) >= 0.20:
+                self.state.book.down_bid = None
+                self.state.book.down_ask = round(max(0.01, 1.0 - bid), 2)
+        else:
+            self.state.book.down_bid, self.state.book.down_ask = bid, ask
+            if ev_ts > self.state.down_book_ts:
+                self.state.down_book_ts = ev_ts
+            self.state.down_book_local_ts = local_ts
+            self.state.down_book_lag_sec = lag_sec
+            if via_ws and bid is not None and bid >= 0.92 and (self.state.book.up_bid or 0.0) >= 0.20:
+                self.state.book.up_bid = None
+                self.state.book.up_ask = round(max(0.01, 1.0 - bid), 2)
+
+        self.state.last_book_lag_sec = lag_sec
+        if via_ws:
+            self.state.last_ws_book_local_ts = local_ts
+            self.state.last_book_update_local_ts = local_ts
+        elif bid is not None or ask is not None:
+            self.state.last_book_update_local_ts = local_ts
+
+        if self.state._window_is_rollover and not self.state._window_first_book_recorded and self.state.current_window_ts > 0:
+            self.state._window_first_book_recorded = True
+            self.health.rollover_first_book_ms.append(max(0.0, (now_u - self.state.current_window_ts) * 1000.0))
+
+    def apply_clob_book_payload(
+        self,
+        token_id: str,
+        payload: Dict[str, Any],
+        via_ws: bool = True,
+    ) -> bool:
+        """Apply a full L2 `book` snapshot (WS or REST) into incremental maps and recompute VWAP top."""
+        if not token_id:
+            return False
+        if token_id == self.state.up_token:
+            side = "UP"
+            held_ts = self.state.up_book_ts
+        elif token_id == self.state.down_token:
+            side = "DOWN"
+            held_ts = self.state.down_book_ts
+        else:
+            return False
+
+        ev_ts = _parse_book_ts_sec(payload)
+        now_u = self.utc_now()
+        if via_ws and ev_ts > 0.0 and (now_u - ev_ts) > 2.5:
+            return False
+        if ev_ts > 0.0 and ev_ts < held_ts - (0.02 if via_ws else 0.05):
+            return False
+
+        bids_map = _levels_to_map(payload.get("bids"))
+        asks_map = _levels_to_map(payload.get("asks"))
+        if side == "UP":
+            self.state._up_bids = bids_map
+            self.state._up_asks = asks_map
+            self.state._up_book_initialized = True
+        else:
+            self.state._down_bids = bids_map
+            self.state._down_asks = asks_map
+            self.state._down_book_initialized = True
+
+        bid, ask = extract_executable_bid_ask_from_maps(bids_map, asks_map, target_usdc=self.target_usdc)
+        self._record_book_side(side, bid, ask, ev_ts, now_u, via_ws=via_ws)
+        if via_ws:
+            self.health.clob_ws_book_msgs += 1
+        return True
+
+    def apply_clob_price_change_payload(self, payload: Dict[str, Any], via_ws: bool = True) -> bool:
+        """Apply incremental CLOB WS `price_change` deltas (orders/cancels) to L2 maps without REST polling."""
+        ev_ts = _parse_book_ts_sec(payload)
+        now_u = self.utc_now()
+        if via_ws and ev_ts > 0.0 and (now_u - ev_ts) > 2.5:
+            return False
+
+        changes = payload.get("price_changes") or payload.get("changes") or ()
+        touched: set[str] = set()
+        for ch in changes:
+            if not isinstance(ch, dict):
+                continue
+            aid = str(ch.get("asset_id") or payload.get("asset_id") or "")
+            if aid and aid == self.state.up_token:
+                side = "UP"
+                initialized = self.state._up_book_initialized
+                held_ts = self.state.up_book_ts
+                bids_map, asks_map = self.state._up_bids, self.state._up_asks
+            elif aid and aid == self.state.down_token:
+                side = "DOWN"
+                initialized = self.state._down_book_initialized
+                held_ts = self.state.down_book_ts
+                bids_map, asks_map = self.state._down_bids, self.state._down_asks
+            else:
+                continue
+
+            if not initialized:
+                continue
+            if ev_ts > 0.0 and ev_ts < held_ts - 0.05:
+                continue
+            try:
+                px = round(float(ch.get("price") or 0.0), 4)
+                sz = float(ch.get("size") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if not (0.0 < px < 1.0):
+                continue
+
+            b_side = str(ch.get("side") or "").upper()
+            target = bids_map if b_side == "BUY" else (asks_map if b_side == "SELL" else None)
+            if target is None:
+                continue
+            if sz <= 0.0:
+                target.pop(px, None)
+            else:
+                target[px] = sz
+            touched.add(side)
+
+        if not touched:
+            return False
+
+        for side in touched:
+            bids_map = self.state._up_bids if side == "UP" else self.state._down_bids
+            asks_map = self.state._up_asks if side == "UP" else self.state._down_asks
+            if not bids_map and not asks_map:
+                continue
+            bid, ask = extract_executable_bid_ask_from_maps(bids_map, asks_map, target_usdc=self.target_usdc)
+            self._record_book_side(side, bid, ask, ev_ts, now_u, via_ws=via_ws)
+        if via_ws:
+            self.health.clob_ws_price_change_msgs += 1
+        return True
+
     def _poll_cex_rest_once(self) -> None:
-        """HTTPS REST fallback + HTTP Date server UTC sync."""
+        """HTTPS REST fallback + millisecond Binance /api/v3/time clock sync."""
         now = time.time()
+        if self.chainlink._precise_clock_synced_ts <= 0.0 or (now - self.chainlink._precise_clock_synced_ts) >= 600.0:
+            self.chainlink.sync_clock_precise(self._http)
+
         need_book = (now - self.state.binance_ts) >= 2.5
-        need_clock = (len(self.chainlink._clock_samples) < 3) or ((now - self._last_clock_sync_ts) >= 60.0)
+        need_clock = (
+            self.chainlink._precise_clock_synced_ts <= 0.0
+            and ((len(self.chainlink._clock_samples) < 3) or ((now - self._last_clock_sync_ts) >= 60.0))
+        )
         if need_book or need_clock:
             try:
                 r = self._http.get(BINANCE_REST_BOOK_URL, timeout=2.0)
@@ -563,6 +803,8 @@ class LiveMarketHub:
                             self.state.update_usdt_basis()
                             self.tracker.on_book_ticker(bid_q, ask_q)
             except Exception:
+                if not self._stop_event.is_set():
+                    self.health.binance_ws_reconnects += 1
                 await asyncio.sleep(2.5)
 
     async def _coinbase_ws_loop(self) -> None:
@@ -587,6 +829,8 @@ class LiveMarketHub:
                             self.state.coinbase_ts = time.time()
                             self.state.update_usdt_basis()
             except Exception:
+                if not self._stop_event.is_set():
+                    self.health.coinbase_ws_reconnects += 1
                 await asyncio.sleep(2.5)
 
     async def _polymarket_window_and_book_loop(self) -> None:
@@ -641,87 +885,126 @@ class LiveMarketHub:
             )
             if self.state.up_token and self.state.down_token and (ws_silent or book_empty):
                 up_t, dn_t = self.state.up_token, self.state.down_token
-                up_res, down_res = await asyncio.gather(
-                    loop.run_in_executor(None, fetch_clob_book_top, up_t, self._http, 2.5, self.target_usdc),
-                    loop.run_in_executor(None, fetch_clob_book_top, dn_t, self._http, 2.5, self.target_usdc),
+                up_raw, down_raw = await asyncio.gather(
+                    loop.run_in_executor(None, fetch_clob_book_raw, up_t, self._http, 2.5),
+                    loop.run_in_executor(None, fetch_clob_book_raw, dn_t, self._http, 2.5),
                 )
                 if self.state.current_window_ts == window_ts:
-                    ub, ua, uts = up_res
-                    db, da, dts = down_res
-                    if uts <= 0.0 or uts >= self.state.up_book_ts - 0.05:
-                        self.state.book.up_bid, self.state.book.up_ask = ub, ua
-                        if uts > self.state.up_book_ts:
-                            self.state.up_book_ts = uts
-                        if ub is not None or ua is not None:
-                            self.state.last_book_update_local_ts = time.time()
-                    if dts <= 0.0 or dts >= self.state.down_book_ts - 0.05:
-                        self.state.book.down_bid, self.state.book.down_ask = db, da
-                        if dts > self.state.down_book_ts:
-                            self.state.down_book_ts = dts
-                        if db is not None or da is not None:
-                            self.state.last_book_update_local_ts = time.time()
+                    self.health.clob_rest_fallbacks += 1
+                    if up_raw is not None:
+                        self.apply_clob_book_payload(up_t, up_raw, via_ws=False)
+                    if down_raw is not None:
+                        self.apply_clob_book_payload(dn_t, down_raw, via_ws=False)
 
             await asyncio.sleep(1.2)
 
-    async def _polymarket_clob_ws_loop(self) -> None:
+    async def _open_clob_ws(self, tokens: List[str]) -> Any:
         import websockets
 
-        subscribed_window = 0
-        while not self._stop_event.is_set():
-            if not self.state.up_token or not self.state.down_token:
-                await asyncio.sleep(0.5)
-                continue
+        ws = await websockets.connect(
+            POLY_CLOB_WS_URL,
+            ping_interval=15,
+            ping_timeout=10,
+            open_timeout=8,
+            close_timeout=2,
+        )
+        await ws.send(json.dumps({"assets_ids": tokens, "type": "market"}))
+        return ws
 
-            subscribed_window = self.state.current_window_ts
-            tokens = [self.state.up_token, self.state.down_token]
-            try:
-                async with websockets.connect(
-                    POLY_CLOB_WS_URL,
-                    ping_interval=15,
-                    ping_timeout=10,
-                    open_timeout=8,
-                    close_timeout=2,
-                ) as ws:
-                    await ws.send(json.dumps({"assets_ids": tokens, "type": "market"}))
+    async def _close_standby_task(self, standby_task: Optional[asyncio.Task]) -> None:
+        if standby_task is None:
+            return
+        if not standby_task.done():
+            standby_task.cancel()
+        try:
+            ws = await standby_task
+            if ws is not None:
+                await ws.close()
+        except Exception:
+            pass
+
+    async def _polymarket_clob_ws_loop(self) -> None:
+        subscribed_window = 0
+        standby_window = 0
+        standby_tokens: Tuple[str, str] = ("", "")
+        standby_task: Optional[asyncio.Task] = None
+
+        try:
+            while not self._stop_event.is_set():
+                if not self.state.up_token or not self.state.down_token:
+                    await asyncio.sleep(0.25)
+                    continue
+
+                subscribed_window = self.state.current_window_ts
+                tokens = [self.state.up_token, self.state.down_token]
+                ws = None
+                try:
+                    if (
+                        standby_task is not None
+                        and standby_window == subscribed_window
+                        and list(standby_tokens) == tokens
+                    ):
+                        task_ref = standby_task
+                        standby_task = None
+                        standby_window = 0
+                        standby_tokens = ("", "")
+                        ws = await task_ref
+                    else:
+                        if standby_task is not None and standby_window < subscribed_window:
+                            await self._close_standby_task(standby_task)
+                            standby_task = None
+                            standby_window = 0
+                            standby_tokens = ("", "")
+                        ws = await self._open_clob_ws(tokens)
+
                     last_msg_ts = time.time()
                     while (
                         not self._stop_event.is_set()
                         and self.state.current_window_ts == subscribed_window
                     ):
+                        next_w = subscribed_window + 300
+                        if (
+                            (self.utc_now() - subscribed_window) >= 290.0
+                            and next_w in self._prefetched_tokens
+                            and standby_task is None
+                        ):
+                            nxt_pair = self._prefetched_tokens[next_w]
+                            standby_window = next_w
+                            standby_tokens = nxt_pair
+                            standby_task = asyncio.create_task(self._open_clob_ws(list(nxt_pair)))
+
                         if time.time() - last_msg_ts >= 12.0:
+                            self.health.clob_ws_reconnects += 1
                             break
                         try:
                             raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
                         except asyncio.TimeoutError:
                             continue
                         last_msg_ts = time.time()
-                        payload = json.loads(raw)
+                        if not raw or raw in ("PING", "PONG"):
+                            continue
+                        try:
+                            payload = json.loads(raw)
+                        except ValueError:
+                            continue
                         events = payload if isinstance(payload, list) else [payload]
-                        now_u = self.utc_now()
                         for ev in events:
-                            if isinstance(ev, dict) and ev.get("event_type") == "book":
-                                ev_ts = _parse_book_ts_sec(ev)
-                                if ev_ts > 0.0 and (now_u - ev_ts) > 2.5:
-                                    continue
-                                aid = ev.get("asset_id")
-                                bid, ask = extract_executable_bid_ask(ev, target_usdc=self.target_usdc)
-                                if aid == self.state.up_token and (ev_ts <= 0.0 or ev_ts >= self.state.up_book_ts - 0.02):
-                                    self.state.book.up_bid, self.state.book.up_ask = bid, ask
-                                    if ev_ts > self.state.up_book_ts:
-                                        self.state.up_book_ts = ev_ts
-                                    self.state.last_ws_book_local_ts = time.time()
-                                    self.state.last_book_update_local_ts = self.state.last_ws_book_local_ts
-                                    if bid is not None and bid >= 0.92 and (self.state.book.down_bid or 0.0) >= 0.20:
-                                        self.state.book.down_bid = None
-                                        self.state.book.down_ask = round(max(0.01, 1.0 - bid), 2)
-                                elif aid == self.state.down_token and (ev_ts <= 0.0 or ev_ts >= self.state.down_book_ts - 0.02):
-                                    self.state.book.down_bid, self.state.book.down_ask = bid, ask
-                                    if ev_ts > self.state.down_book_ts:
-                                        self.state.down_book_ts = ev_ts
-                                    self.state.last_ws_book_local_ts = time.time()
-                                    self.state.last_book_update_local_ts = self.state.last_ws_book_local_ts
-                                    if bid is not None and bid >= 0.92 and (self.state.book.up_bid or 0.0) >= 0.20:
-                                        self.state.book.up_bid = None
-                                        self.state.book.up_ask = round(max(0.01, 1.0 - bid), 2)
-            except Exception:
-                await asyncio.sleep(1.5)
+                            if not isinstance(ev, dict):
+                                continue
+                            ev_type = str(ev.get("event_type") or "")
+                            if ev_type == "book":
+                                self.apply_clob_book_payload(str(ev.get("asset_id") or ""), ev, via_ws=True)
+                            elif ev_type == "price_change":
+                                self.apply_clob_price_change_payload(ev, via_ws=True)
+                except Exception:
+                    if not self._stop_event.is_set():
+                        self.health.clob_ws_reconnects += 1
+                    await asyncio.sleep(1.5)
+                finally:
+                    if ws is not None:
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+        finally:
+            await self._close_standby_task(standby_task)

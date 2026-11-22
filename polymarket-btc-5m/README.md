@@ -28,9 +28,9 @@
 
 ## 快速啟動
 
-```powershell
+```bash
 cd polymarket-btc-5m
-pip install -r requirements.txt
+pip install -r ../requirements.lock
 
 # 1. 執行單元測試（含 Chainlink ABI 解碼與 Oracle Gap 防護驗證）
 python -m unittest discover -s tests -v

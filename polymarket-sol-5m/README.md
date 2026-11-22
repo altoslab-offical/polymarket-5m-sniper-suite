@@ -31,11 +31,10 @@
 
 其餘參數（Z 門檻、進場價、停利停損、波動率下限）**沿用 BTC 版，尚未針對 SOL 調整**。
 
-## 安裝與啟動（PowerShell）
-```powershell
+## 安裝與啟動
+```bash
 cd polymarket-sol-5m
-chcp 65001
-pip install -r requirements.txt
+pip install -r ../requirements.lock
 python -m unittest discover -s tests
 
 # 模擬盤（先跑這個錄資料）

@@ -23,6 +23,25 @@
 
 ---
 
+## v4.5 盤口即時性、異常對帳、毫秒校時與行程韌性升級
+
+> 策略門檻與進場頻率 **100% 維持原版 v4.2（`t=0` Spot Strike + `BOOK_CALIBRATED`）**，專注消滅實盤「用舊盤口進場 / 逾時失控持倉 / 時鐘偏移」：
+
+1. **CLOB 增量 `price_change` L2 盤口引擎 + 嚴格過期閘門（`1.5s / 1.0s`）**
+   - `feeds.py` 同時處理 `book` 全量與 `price_change` 增量掛撤單事件，逐價位更新 `price -> size` L2 表並重算深度 VWAP 買賣價，消除兩次成交間長達 `2.5s+` 的盤口靜止與頻繁 REST 補抓。
+   - 實盤下單閘門收緊為 `book_age > 1.5s or book_lag > 1.0s`，每筆進場日誌紀錄毫秒級 `book_age` / `book_lag`。
+2. **鏈上備援與交易完全隔離（Strict Origin Freshness）**
+   - `chainlink_oracle.py` 將 Polygon/Arbitrum JSON-RPC 輪詢嚴格隔離至 `onchain_display_price` 僅作展示比對，絕不寫入 `settlement_reference_price`；`is_alive()` 驗證串流來源且檢查 `oracle_ts` 新鮮度。
+   - 移除 RTDS 萬用字元 `filters: ""`，改為精確幣種過濾 `'{"symbol":"{btc|eth|sol}/usd"}'` 並啟用雙連線熱備援與 `3.5s` 斷流重連。
+3. **下單逾時自動對帳（`RECONCILED_POSITION`）與啟動接管**
+   - `PolymarketLiveExecutor` 收緊為 `httpx.Timeout(connect=2, read=3, write=3, pool=2)`；非明確 4xx 拒單例外（如讀取逾時）立即於 `1~2s` 內輪詢 `get_trades` 與條件代幣餘額，若已成交則標記 `RECONCILED_POSITION` 立即納入止盈／止損管理。啟動時同步掃描當窗未平倉代幣餘額自動接管。
+4. **毫秒級 Binance `/api/v3/time` RTT/2 校時（`±50ms` 死區）與換窗預連線**
+   - 啟動及每 10 分鐘量測 `serverTime - (t0 + RTT/2)` 精準校準 `utc_now()`，誤差 `> 250ms` 發出 Telegram 警報；`290s` 預連下一窗 CLOB WebSocket 以縮短跨窗盤口真空。
+5. **非終端機日誌輪替（`50MB x 5`）＋ macOS `launchd` / Linux `systemd` 守護**
+   - `--log-file` 啟用 `RotatingFileHandler` 且偵測 `not isatty()` 時自動關閉每秒 `\r` 洗版；`daily_review.py` 新增 `book_age P50/P99`、`book_lag`、換窗首單延遲與時鐘殘差健檢表；新增 [`requirements.lock`](./requirements.lock) 鎖定全部執行期套件版本。
+
+---
+
 ## v4.4 執行速度與穩定度強化（Zero-Side-Effect，100% 保留 v4.2 策略與頻率）
 
 > `config.py`、`pricing_model.py`、`strategy.py`、`feeds.py` 完全未動，**0 影響開單門檻與頻率**，專注壓低實盤進／出場延遲並消除連線與檔案鎖風險：
@@ -62,13 +81,15 @@
 ```text
 polymarket-5m-sniper-suite/
 ├── shared_risk.py          # 10% 等比算股數、5 股安全保底與跨幣日熔斷 / 互斥鎖
-├── daily_review.py         # 每日唯讀健檢引擎（進程、滑價、分桶勝率與漸進建議）
+├── daily_review.py         # 每日唯讀健檢引擎（進程、滑價、分桶勝率、P99新鮮度與時鐘健檢）
 ├── start_all.sh            # 一鍵啟動 BTC / ETH / SOL（預設模擬盤，加 --live 進實盤）
-├── requirements.txt        # 統一依賴（含 py-clob-client-v2 與 httpx[http2]）
+├── requirements.txt        # 基礎依賴清單
+├── requirements.lock       # 完整鎖定執行期版本（py-clob-client-v2 / websockets / httpx）
 ├── test_live_sizing_risk.py
 ├── test_daily_review.py
 ├── test_upgrades_v43.py
 ├── test_upgrades_v44.py
+├── test_upgrades_v45.py
 ├── polymarket-btc-5m/      # BTC 5m 監控＋下單（Telegram 主控）
 ├── polymarket-eth-5m/      # ETH 5m 監控＋下單（單向推播）
 └── polymarket-sol-5m/      # SOL 5m 監控＋下單（單向推播）
@@ -82,8 +103,10 @@ polymarket-5m-sniper-suite/
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements.lock
 ```
+
+*(macOS 正式實盤建議改用純 ASCII 路徑部署並以 `launchd` KeepAlive + `caffeinate -dimsu` 託管，避免睡眠或終端關閉中斷；Linux VPS 建議以 `systemd` `Restart=always` + `chrony` 校時託管。)*
 
 ### 2. 設定各幣 `.env` 與確認 `signature_type`
 
@@ -120,8 +143,8 @@ cd polymarket-btc-5m
 ### 5. 執行單元測試與每日唯讀健檢
 
 ```bash
-# 執行全部測試（等比倉位、日熔斷、健檢、v4.3/v4.4 升級與三幣核心邏輯）
-.venv/bin/pytest -q test_live_sizing_risk.py test_daily_review.py test_upgrades_v43.py test_upgrades_v44.py
+# 執行全部測試（等比倉位、日熔斷、健檢、v4.3/v4.4/v4.5 升級與三幣核心邏輯）
+.venv/bin/pytest -q test_live_sizing_risk.py test_daily_review.py test_upgrades_v43.py test_upgrades_v44.py test_upgrades_v45.py
 (cd polymarket-btc-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-eth-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-sol-5m && ../.venv/bin/pytest -q tests/)

@@ -30,6 +30,8 @@ CHAINLINK_DATAENGINE_HOST = "ws.dataengine.chain.link"
 
 POLYBOLT_WS_URL = "wss://ws-live-v2.polymarket.com/ws"
 POLY_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
+STREAMING_ORACLE_SOURCES = ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK", "POLY_RTDS_CHAINLINK")
+BINANCE_TIME_URLS = ("https://api.binance.com/api/v3/time", "https://data-api.binance.vision/api/v3/time")
 
 POLYGON_CHAINLINK_ETH_USD = "0xF9680D99D6C9589e2a93a78A04A279e509205945"  # Chainlink ETH/USD aggregator (Polygon)
 ARBITRUM_CHAINLINK_ETH_USD = "0x639Fe6ab55C921f74e7fac1ee960C0B6293ba612"  # Chainlink ETH/USD aggregator (Arbitrum One)
@@ -149,12 +151,28 @@ class ChainlinkOracleState:
     local_recv_ts: float = 0.0      # Wall-clock time of last verified live response
     source: str = "UNINITIALIZED"
     round_id: Optional[int] = None
+    onchain_display_price: Optional[float] = None
+    onchain_display_source: str = ""
+    onchain_display_ts: float = 0.0
+    clock_offset_sec: float = 0.0
 
-    def is_alive(self, max_silence_sec: float = 18.0) -> bool:
-        """True only if we received a live oracle verification within `max_silence_sec`."""
+    def is_alive(self, max_silence_sec: float = 4.5, max_oracle_age_sec: Optional[float] = None) -> bool:
+        """True only for fresh streaming Chainlink sources (on-chain RPCs never feed live orders)."""
         if self.price is None or self.local_recv_ts <= 0:
             return False
-        return (time.time() - self.local_recv_ts) <= max_silence_sec
+        if self.source not in STREAMING_ORACLE_SOURCES:
+            return False
+        if (time.time() - self.local_recv_ts) > max_silence_sec:
+            return False
+        eff_oracle_age = (
+            max_oracle_age_sec
+            if max_oracle_age_sec is not None
+            else (5.0 if self.source == "POLY_RTDS_CHAINLINK" else 4.0)
+        )
+        now_utc = time.time() + self.clock_offset_sec
+        if self.oracle_ts > 0.0 and (now_utc - self.oracle_ts) > eff_oracle_age:
+            return False
+        return True
 
     @property
     def settlement_reference_price(self) -> Optional[float]:
@@ -175,17 +193,63 @@ class ChainlinkOracleFeed:
         self._utc_history: Deque[Tuple[float, float]] = deque(maxlen=360)  # (oracle_utc_ts, price)
         self._utc_twap_history: Deque[Tuple[float, float]] = deque(maxlen=360)
         self.clock_offset_sec: float = 0.0
+        self.raw_clock_offset_ms: float = 0.0
+        self._precise_clock_synced_ts: float = 0.0
         self._clock_samples: Deque[float] = deque(maxlen=15)
+        self.rtds_reconnects: int = 0
+        self.polybolt_reconnects: int = 0
         self._stop_event = asyncio.Event()
         self._http = requests.Session()
         self._rr_idx = 0
 
+    @property
+    def effective_clock_offset_ms(self) -> float:
+        """Residual clock skew remaining after `clock_offset_sec` correction (in milliseconds)."""
+        return round(self.raw_clock_offset_ms - self.clock_offset_sec * 1000.0, 1)
+
+    def update_clock_offset_precise(self, offset_sec: float) -> float:
+        """Apply RTT-compensated millisecond server clock offset with a +/-50ms deadband."""
+        if abs(offset_sec) > 86400.0:
+            return self.raw_clock_offset_ms
+        self.raw_clock_offset_ms = round(offset_sec * 1000.0, 1)
+        self.clock_offset_sec = offset_sec if abs(offset_sec) >= 0.05 else 0.0
+        self.state.clock_offset_sec = self.clock_offset_sec
+        self._precise_clock_synced_ts = time.time()
+        return self.raw_clock_offset_ms
+
+    def sync_clock_precise(self, session: Optional[requests.Session] = None, samples: int = 3) -> Optional[float]:
+        """Measure UTC offset against Binance `/api/v3/time` (ms resolution) subtracting RTT/2."""
+        http = session or self._http
+        offs: List[float] = []
+        n_probes = max(1, int(samples))
+        for idx in range(n_probes):
+            url = BINANCE_TIME_URLS[idx % len(BINANCE_TIME_URLS)]
+            try:
+                t0 = time.time()
+                resp = http.get(url, timeout=2.0)
+                t1 = time.time()
+                if resp.status_code != 200:
+                    continue
+                rtt = max(0.0, t1 - t0)
+                if rtt > 1.5:
+                    continue
+                srv_ms = float(resp.json()["serverTime"])
+                offs.append((srv_ms / 1000.0) - (t0 + 0.5 * rtt))
+            except Exception:
+                continue
+        if not offs:
+            return None
+        offs.sort()
+        return self.update_clock_offset_precise(offs[len(offs) // 2])
+
     def update_clock_offset(self, server_utc_ts: float, local_ts: Optional[float] = None) -> None:
         """
         Align local PC clock (`time.time()`) with authoritative real-time server UTC timestamps.
-        Uses a +/-1.0s deadband so normal network/HTTP latency never jitters a healthy PC clock,
-        while automatically rescuing clocks that are genuinely drifted by >=1s!
+        Uses a +/-1.0s deadband for coarse 1-second HTTP Date / stream event headers without
+        overwriting a recent millisecond-precise Binance time sync!
         """
+        if self._precise_clock_synced_ts > 0.0 and (time.time() - self._precise_clock_synced_ts) < 900.0:
+            return
         now_local = local_ts if local_ts is not None else time.time()
         diff = server_utc_ts - now_local
         if abs(diff) > 86400.0:
@@ -194,6 +258,8 @@ class ChainlinkOracleFeed:
         ordered = sorted(self._clock_samples)
         med = ordered[len(ordered) // 2]
         self.clock_offset_sec = med if abs(med) >= 1.0 else 0.0
+        self.state.clock_offset_sec = self.clock_offset_sec
+        self.raw_clock_offset_ms = round(med * 1000.0, 1)
 
     def utc_now(self) -> float:
         return time.time() + self.clock_offset_sec
@@ -231,10 +297,17 @@ class ChainlinkOracleFeed:
         now = time.time()
         eff_oracle_ts = oracle_ts if oracle_ts is not None else self.utc_now()
 
-        # Do not overwrite a newer Chainlink round with an older lagging RPC block!
-        is_streaming = source in ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK", "POLY_RTDS_CHAINLINK")
-        stale_tolerance = 10.0 if is_streaming else 1.0
-        if self.state.oracle_ts > 0 and eff_oracle_ts < self.state.oracle_ts - stale_tolerance:
+        # On-chain aggregator rounds lag real-time streams and never trigger or price live orders.
+        is_streaming = source in STREAMING_ORACLE_SOURCES
+        if not is_streaming:
+            if self.state.onchain_display_ts <= 0.0 or eff_oracle_ts >= self.state.onchain_display_ts:
+                self.state.onchain_display_price = price
+                self.state.onchain_display_source = source
+                self.state.onchain_display_ts = eff_oracle_ts
+            return
+
+        # Do not overwrite a newer streaming Chainlink tick with an older lagging one!
+        if self.state.oracle_ts > 0 and eff_oracle_ts < self.state.oracle_ts - 10.0:
             return
 
         self.state.price = price
@@ -323,7 +396,8 @@ class ChainlinkOracleFeed:
     async def start(self) -> None:
         tasks = [self._onchain_round_robin_loop()]
         if has_websockets_installed():
-            tasks.append(self._rtds_chainlink_ws_loop())
+            tasks.append(self._rtds_chainlink_ws_loop(slot=0))
+            tasks.append(self._rtds_chainlink_ws_loop(slot=1))
             cl_key = os.getenv("CHAINLINK_STREAMS_API_KEY")
             cl_secret = os.getenv("CHAINLINK_STREAMS_API_SECRET")
             if cl_key and cl_secret:
@@ -406,19 +480,25 @@ class ChainlinkOracleFeed:
                             self._utc_twap_history.append((self.utc_now(), norm_p))
                         else:
                             self.on_chainlink_tick(norm_p, "POLYBOLT_CHAINLINK")
+                if not self._stop_event.is_set():
+                    self.polybolt_reconnects += 1
+                    await asyncio.sleep(1.5)
             except Exception:
+                if not self._stop_event.is_set():
+                    self.polybolt_reconnects += 1
                 await asyncio.sleep(2.5)
 
-    async def _rtds_chainlink_ws_loop(self) -> None:
+    async def _rtds_chainlink_ws_loop(self, slot: int = 0) -> None:
         import websockets
 
-        # Subscribe with wildcard/empty filter as well as explicit symbol filters for compatibility
+        if slot > 0:
+            await asyncio.sleep(1.5 * slot)
+
+        # Subscribe strictly to ETH/USD via compact JSON filter (wildcards pull 8+ coins wastefully)
         sub_msg = {
             "action": "subscribe",
             "subscriptions": [
-                {"topic": "crypto_prices_chainlink", "type": "*", "filters": ""},
                 {"topic": "crypto_prices_chainlink", "type": "*", "filters": '{"symbol":"eth/usd"}'},
-                {"topic": "crypto_prices_chainlink", "type": "*", "filters": "ETH/USD"},
             ],
         }
 
@@ -439,16 +519,16 @@ class ChainlinkOracleFeed:
                     while not self._stop_event.is_set():
                         now_loop = time.time()
                         # Break out of silent/zombie sessions (e.g. RTDS drops topic push while still replying PONG)
-                        if now_loop - last_eth_tick_ts >= 10.0:
+                        if now_loop - last_eth_tick_ts >= 3.5:
                             break
-                        if now_loop - last_eth_tick_ts >= 5.0 and now_loop - last_resub_ts >= 5.0:
+                        if now_loop - last_eth_tick_ts >= 2.0 and now_loop - last_resub_ts >= 2.0:
                             await ws.send(json.dumps(sub_msg))
                             last_resub_ts = now_loop
                         if now_loop - last_ping >= 5.0:
                             await ws.send("PING")
                             last_ping = now_loop
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                            raw = await asyncio.wait_for(ws.recv(), timeout=1.5)
                         except asyncio.TimeoutError:
                             continue
 
@@ -483,22 +563,22 @@ class ChainlinkOracleFeed:
                                 oracle_ts=obs_ts,
                                 round_id=int(round_id) if round_id else None,
                             )
+                if not self._stop_event.is_set():
+                    self.rtds_reconnects += 1
+                    await asyncio.sleep(1.0)
             except Exception:
+                if not self._stop_event.is_set():
+                    self.rtds_reconnects += 1
                 await asyncio.sleep(1.5)
 
     async def _onchain_round_robin_loop(self) -> None:
         """
         Polls Arbitrum + Polygon Chainlink contracts across 8 RPCs in round-robin rotation
-        whenever no streaming Tier 1/2/3 tick arrived in the last 3 seconds.
-        Each individual RPC is only queried ~once every 24 seconds -> immune to 429 rate limits!
+        strictly for display/diagnostic comparison (NEVER feeds live entry/exit signals!).
         """
         loop = asyncio.get_running_loop()
         while not self._stop_event.is_set():
-            is_streaming = (
-                self.state.source in ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK", "POLY_RTDS_CHAINLINK")
-                and (time.time() - self.state.local_recv_ts) < 3.0
-            )
-            if not is_streaming:
+            if not self.state.is_alive(max_silence_sec=4.5):
                 res = await loop.run_in_executor(None, self._poll_round_robin_onchain)
                 if res is not None:
                     label, round_id, price, updated_at = res
@@ -508,4 +588,4 @@ class ChainlinkOracleFeed:
                         oracle_ts=float(updated_at),
                         round_id=round_id,
                     )
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(15.0)
