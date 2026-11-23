@@ -275,8 +275,8 @@ def test_p0_2_and_p1_wiring_across_all_coins(coin_dir: str, sym_filter: str) -> 
     assert '"filters": ""' not in oracle_src
     assert f'"filters": \'{{"symbol":"{sym_filter}"}}\'' in oracle_src
     assert "slot=0" in oracle_src and "slot=1" in oracle_src
-    assert ">= 3.5:" in oracle_src
-    assert "_open_clob_ws" in feeds_src and ">= 290.0" in feeds_src and "polymarket-5m-sniper/4.5" in feeds_src
+    assert "_rtds_zombie_timeout_sec(" in oracle_src and "else 3.5" in oracle_src
+    assert "_open_clob_ws" in feeds_src and ">= 290.0" in feeds_src and "polymarket-5m-sniper/4.6" in feeds_src
     assert "book_age > 1.5 or book_lag > 1.0" in mon_src and "RotatingFileHandler" in mon_src and "if is_tty:" in mon_src
     assert "else (elapsed if st.up_token else 0.0)" in mon_src
 

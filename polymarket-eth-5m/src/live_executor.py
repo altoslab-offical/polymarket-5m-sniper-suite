@@ -216,15 +216,22 @@ class PolymarketLiveExecutor:
     def warmup_tokens(self, *token_ids: Optional[str]) -> None:
         """
         Pre-populate py-clob-client-v2 internal caches (tick_size, condition_id, market_info, fee_rate, version)
-        during the early WAIT phase so live sniper entries fire in 1 warm HTTP/2 POST (~150ms instead of ~4.1s)!
+        during the early WAIT phase so live sniper entries and Maker exits fire in 1 warm HTTP/2 POST!
         """
-        from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
+        from py_clob_client_v2 import (
+            MarketOrderArgs,
+            OrderArgs,
+            OrderType,
+            PartialCreateOrderOptions,
+            Side,
+        )
 
         for tok in token_ids:
             if not tok or tok in self._warmed_tokens:
                 continue
             try:
                 ts = self._get_tick_size_cached(tok)
+                opts = PartialCreateOrderOptions(tick_size=ts)
                 # Dry-run build ONLY (never posted!) populates __token_condition_map, __fee_infos & __cached_version
                 self.client.create_market_order(
                     MarketOrderArgs(
@@ -234,7 +241,16 @@ class PolymarketLiveExecutor:
                         price=0.50,
                         order_type=OrderType.FAK,
                     ),
-                    options=PartialCreateOrderOptions(tick_size=ts),
+                    options=opts,
+                )
+                self.client.create_order(
+                    OrderArgs(
+                        token_id=tok,
+                        price=0.99,
+                        size=5.0,
+                        side=Side.SELL,
+                    ),
+                    options=opts,
                 )
                 self._warmed_tokens.add(tok)
                 self._last_keepalive_ts = time.time()
@@ -385,11 +401,18 @@ class PolymarketLiveExecutor:
         """Compute EV-guarded limit cap and minimum-5-share-safe pUSD order notional."""
         from .fees import taker_fee_per_share
 
-        limit_px = round(min(max_price, float(ask_price) + 0.01), 2)
+        ask_f = float(ask_price)
+        base_cand = round(min(max_price, ask_f + 0.01), 2)
+        limit_px = base_cand
+        if p_true > 0.0 and base_cand > 0.82 + 1e-9:
+            if (p_true - base_cand - taker_fee_per_share(base_cand, fee_rate)) < 0.045:
+                limit_px = round(min(0.82, ask_f), 2)
+
         if p_true > 0.0:
-            for extra in (0.04, 0.03, 0.02):
-                cand = round(min(max_price, float(ask_price) + extra), 2)
-                if (p_true - cand - taker_fee_per_share(cand, fee_rate)) >= 0.035:
+            for extra in (0.04, 0.03, 0.02, 0.01):
+                cand = round(min(max_price, ask_f + extra), 2)
+                min_ev = 0.045 if cand > 0.82 + 1e-9 else 0.035
+                if (p_true - cand - taker_fee_per_share(cand, fee_rate)) >= min_ev:
                     limit_px = cand
                     break
         if float(shares) >= 5.0:
@@ -400,7 +423,7 @@ class PolymarketLiveExecutor:
                 available_pusd=available_pusd,
             )
         else:
-            usdc_amount = round(float(shares) * float(ask_price), 2)
+            usdc_amount = round(float(shares) * ask_f, 2)
         return limit_px, usdc_amount
 
     def execute_entry(
@@ -483,12 +506,107 @@ class PolymarketLiveExecutor:
         else:
             self._cond_balance_cache.pop(token_id, None)
 
+    def post_maker_tp_sell(
+        self,
+        token_id: str,
+        shares: float,
+        price: float = 0.99,
+    ) -> LiveFillResult:
+        """Post a GTC post-only Maker take-profit limit sell order (0% taker fee)."""
+        from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
+
+        t0 = time.perf_counter()
+        target_px = round(float(price), 2)
+        cached_avail = self._cond_balance_cache.get(token_id, 0.0)
+        sell_qty = floor_share_qty(min(float(shares), float(cached_avail)) if cached_avail > 0.0 else 0.0)
+        if sell_qty < 5.0:
+            return LiveFillResult(
+                False,
+                0.0,
+                target_px,
+                error="Conditional balance below 5-share GTC minimum",
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
+
+        tick_size = self._get_tick_size_cached(token_id)
+        try:
+            resp = self.client.create_and_post_order(
+                order_args=OrderArgs(
+                    token_id=token_id,
+                    price=target_px,
+                    size=sell_qty,
+                    side=Side.SELL,
+                ),
+                options=PartialCreateOrderOptions(tick_size=tick_size),
+                order_type=OrderType.GTC,
+                post_only=True,
+            )
+            parsed = parse_clob_fill_response(resp, target_px)
+            if parsed.error:
+                parsed.latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                return parsed
+            if parsed.filled and parsed.filled_shares > 0.0:
+                self._update_cond_cache_after_exit(token_id, sell_qty, parsed.filled_shares)
+                parsed.latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+                return parsed
+            return LiveFillResult(
+                filled=False,
+                filled_shares=0.0,
+                avg_price=target_px,
+                order_id=parsed.order_id,
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
+        except Exception as exc:
+            return LiveFillResult(
+                False,
+                0.0,
+                target_px,
+                error=str(exc),
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
+            )
+
+    def check_maker_order_status(
+        self,
+        order_id: str,
+        price: float = 0.99,
+        token_id: str = "",
+        posted_qty: float = 0.0,
+    ) -> LiveFillResult:
+        """Query CLOB order status for a resting Maker TP sell and update balance cache if filled."""
+        target_px = round(float(price), 2)
+        if not order_id:
+            return LiveFillResult(False, 0.0, target_px, error="Missing order_id")
+        try:
+            detail = self.client.get_order(order_id)
+            res = parse_clob_fill_response(detail, target_px)
+            if res.filled_shares > 0.0:
+                tok = token_id or (str(detail.get("asset_id") or "") if isinstance(detail, dict) else "")
+                if tok:
+                    base_qty = posted_qty if posted_qty > 0.0 else self._cond_balance_cache.get(tok, 0.0)
+                    if base_qty > 0.0:
+                        self._update_cond_cache_after_exit(tok, base_qty, res.filled_shares)
+            return res
+        except Exception as exc:
+            return LiveFillResult(False, 0.0, target_px, order_id=order_id, error=str(exc))
+
+    def cancel_order_safe(self, order_id: str) -> bool:
+        """Cancel a resting CLOB order safely without raising on already-filled or expired orders."""
+        if not order_id:
+            return False
+        try:
+            self.client.cancel_orders([order_id])
+            return True
+        except Exception as exc:
+            sys.stderr.write(f"[CLOB CANCEL WARN] order={order_id[:16]}: {exc}\n")
+            return False
+
     def execute_exit(
         self,
         token_id: str,
         bid_price: float,
         shares: float,
         slippage_cents: float = 0.03,
+        min_limit_px: float = 0.01,
     ) -> LiveFillResult:
         """Submit an FAK sell exit with cached conditional balance lookup and 1-shot stop-loss widen."""
         from py_clob_client_v2 import MarketOrderArgs, OrderType, PartialCreateOrderOptions, Side
@@ -502,7 +620,8 @@ class PolymarketLiveExecutor:
                 latency_ms=round((time.perf_counter() - t0) * 1000.0, 1),
             )
 
-        limit_px = round(max(0.01, float(bid_price) - slippage_cents), 2)
+        floor_px = float(min_limit_px)
+        limit_px = round(max(floor_px, float(bid_price) - slippage_cents), 2)
         tick_size = self._get_tick_size_cached(token_id)
 
         for attempt in range(2):
@@ -516,7 +635,7 @@ class PolymarketLiveExecutor:
                 )
                 res = self._verify_fill_if_needed(parse_clob_fill_response(resp, limit_px), limit_px, est_shares=sell_qty)
                 if attempt == 0 and not res.filled and res.error and "no orders found to match" in res.error.lower() and slippage_cents >= 0.05:
-                    limit_px = round(max(0.01, float(bid_price) - (slippage_cents + 0.05)), 2)
+                    limit_px = round(max(floor_px, float(bid_price) - (slippage_cents + 0.05)), 2)
                     continue
                 if res.filled and res.filled_shares > 0.0:
                     self._update_cond_cache_after_exit(token_id, sell_qty, res.filled_shares)
@@ -530,7 +649,7 @@ class PolymarketLiveExecutor:
                         sell_qty = floor_share_qty(min(float(shares), fresh_avail))
                         continue
                 elif attempt == 0 and "no orders found to match" in err_str.lower() and slippage_cents >= 0.05:
-                    limit_px = round(max(0.01, float(bid_price) - (slippage_cents + 0.05)), 2)
+                    limit_px = round(max(floor_px, float(bid_price) - (slippage_cents + 0.05)), 2)
                     continue
                 return LiveFillResult(
                     False, 0.0, limit_px, error=err_str,

@@ -1,10 +1,27 @@
-# Polymarket 5m Sniper Suite (BTC / ETH / SOL)
+# Polymarket 5m Sniper Suite (BTC / ETH / SOL + XRP / DOGE Paper Scouts)
 
-針對 Polymarket 每 5 分鐘漲跌盤（`{btc|eth|sol}-updown-5m`）打造的三幣整合自動交易與每日健檢套件。在原版 Chainlink 預言機尾盤狙擊架構上，整合 **10% 等比複利倉位管理**、**跨幣共用單日虧損熔斷**、**CLOB V2 授權自動對齊** 與 **每日唯讀健檢報表**。
+> **📋 Claude 策略與實戰健檢包（`2026-11-24 v5.1`）**：完整架構規格、近三日 22 筆實盤 / 8 筆模擬逐筆明細、虧損鑑識與 Phase 4.2 純 OOS 對比請見 **[`CLAUDE_REVIEW_V51_20261124.md`](./CLAUDE_REVIEW_V51_20261124.md)** 及 [`results/`](./results/)。
+
+針對 Polymarket 每 5 分鐘漲跌盤（`{btc|eth|sol|xrp|doge}-updown-5m`）打造的多幣 Chainlink 60s TWAP 尾盤狙擊與實盤風控套件。在 **10% 等比複利**、**跨幣共用單日虧損熔斷** 與 **毫秒級預言機/L2 盤口衛生** 上，於 **`v5.1`** 全面升級為 **Phase 4.2 `E4` 雙源共識策略＋官方預言機硬性守門＋Gamma 即時分幣種手續費率**。
 
 ---
 
-## 相較基礎版（v4.2）的核心升級
+## v5.0 – v5.1 核心升級（Oracle-Anchored `E4` Dual-Consensus Sniper）
+
+1. **官方預言機基準價 Fail-Closed 硬性守門（[`strategy.py`](./polymarket-btc-5m/src/strategy.py) / [`config.py`](./polymarket-btc-5m/src/config.py)）**
+   - 新增 `require_official_oracle_strike=True` 與 `skip_book_calibrated_windows=True`：開新倉**僅允許** `strike_source in ("OFFICIAL_TWAP60", "GAMMA_OFFICIAL")`（經 Live Gamma API 比對 15 盤 `priceToBeat` 誤差 **`0.000000 bps`**），徹底排除 `BOOK_CALIBRATED` 或現貨猜測基準價；且該檢查置於 `_manage_open_position()` 之後，絕不阻斷持倉止損／停利。
+2. **精準對齊 Polymarket Live 分幣種手續費率（`crypto_taker_fee_rate`）**
+   - 依 Polymarket Gamma `feeSchedule` 實測拆分為：**`BTC = 0.05`（`crypto_btc_5m_15m_fees`）**、**`ETH / SOL / XRP / DOGE = 0.01`（`crypto_fees_v2`）**，取代舊版寫死 `0.07`（先前低估山寨幣淨 EV 約 `0.96¢/sh`）。
+3. **Phase 4.2 `E4` 雙源共識過濾 ＋ 30 分鐘純 Binance 1s 波動率（[`pricing_model.py`](./polymarket-btc-5m/src/pricing_model.py) / [`feeds.py`](./polymarket-btc-5m/src/feeds.py)）**
+   - 啟動即以 `data-api.binance.vision` REST 預熱最多 `1,850` 根 1s K 線計算 30 分鐘（`1800s`）單市場波動率（地板 `0.000035`），維護 60 秒因果 `CL - BN` 基差 `mean_basis_60s()`（至少 10 筆樣本）。
+   - 進場強制 `min(|z_CL|, |z_BN_adj|) >= 1.30` 且取保守 `min(P_CL, P_BN)`，搭配 60s TWAP 尾段 Brownian bridge 積分（`0.70` Gaussian + `0.30` Student-t `df=6.0`）、CVD-only 訂單流過濾與 `max_model_market_divergence = 0.25`。
+4. **跨幣單槽保護（`max_coins=1`）＋ Maker `@ $0.990` 停利＋ VPN 看門狗（[`shared_risk.py`](./shared_risk.py) / [`vpn_watchdog.py`](./vpn_watchdog.py)）**
+   - 同一 5m 窗口三幣互斥僅允許最多 1 幣成交；持倉在 bid `>= 0.94` 且 `p_true >= 0.95` 時自動掛 `0% fee` Maker `$0.990` 賣單提前回收 `pUSD`。
+   - 新增 `polymarket-xrp-5m` 與 `polymarket-doge-5m` **純模擬觀察節點（PAPER）**；實證評估後確認 `XRP`/`DOGE` 尚不具實盤條件，僅留作數據蒐集。
+
+---
+
+## v4.2 – v4.5 基礎架構演進（歷史版本說明）
 
 1. **等比複利與 Polymarket 5 股最低限額雙保險（[`shared_risk.py`](./shared_risk.py)）**
    - 支援 `--bet-pct`（預設 `0.10` = 即時可用餘額 `10%` 等比複利），從小資金（如 `$40U`）隨權益成長平滑放大至目標規模，不必手動改固定金額。
@@ -80,19 +97,20 @@
 
 ```text
 polymarket-5m-sniper-suite/
-├── shared_risk.py          # 10% 等比算股數、5 股安全保底與跨幣日熔斷 / 互斥鎖
-├── daily_review.py         # 每日唯讀健檢引擎（進程、滑價、分桶勝率、P99新鮮度與時鐘健檢）
-├── start_all.sh            # 一鍵啟動 BTC / ETH / SOL（預設模擬盤，加 --live 進實盤）
-├── requirements.txt        # 基礎依賴清單
-├── requirements.lock       # 完整鎖定執行期版本（py-clob-client-v2 / websockets / httpx）
-├── test_live_sizing_risk.py
-├── test_daily_review.py
-├── test_upgrades_v43.py
-├── test_upgrades_v44.py
-├── test_upgrades_v45.py
-├── polymarket-btc-5m/      # BTC 5m 監控＋下單（Telegram 主控）
-├── polymarket-eth-5m/      # ETH 5m 監控＋下單（單向推播）
-└── polymarket-sol-5m/      # SOL 5m 監控＋下單（單向推播）
+├── CLAUDE_REVIEW_V51_20261124.md  # v5.1 完整架構、22 筆實盤交易明細、虧損鑑識與 OOS 驗證報告
+├── results/                       # 去識別化實盤／模擬盤逐筆成交匯出（CSV）
+├── shared_risk.py                 # 10% 等比算股數、5 股安全保底、跨幣單槽與日熔斷互斥鎖
+├── daily_review.py                # 每日唯讀健檢引擎（進程、滑價、分桶勝率、P99新鮮度與時鐘健檢）
+├── vpn_watchdog.py                # Surfshark HK VPN / Polymarket geoblock 與 RTT 健康看門狗
+├── start_all.sh                   # 一鍵啟動 BTC / ETH / SOL（預設模擬盤，加 --live 進實盤）
+├── requirements.txt               # 基礎依賴清單
+├── requirements.lock              # 完整鎖定執行期版本（py-clob-client-v2 / websockets / httpx）
+├── test_*.py                      # 跨幣整合測試套件（v4.3–v5.1 共 115 項測試）
+├── polymarket-btc-5m/             # BTC 5m 監控＋實盤下單（Telegram 主控，fee=5%）
+├── polymarket-eth-5m/             # ETH 5m 監控＋實盤下單（單向推播，fee=1%）
+├── polymarket-sol-5m/             # SOL 5m 監控＋實盤下單（單向推播，fee=1%）
+├── polymarket-xrp-5m/             # XRP 5m 模擬觀察＋錄製（PAPER only，fee=1%）
+└── polymarket-doge-5m/            # DOGE 5m 模擬觀察＋錄製（PAPER only，fee=1%）
 ```
 
 ---
@@ -143,8 +161,8 @@ cd polymarket-btc-5m
 ### 5. 執行單元測試與每日唯讀健檢
 
 ```bash
-# 執行全部測試（等比倉位、日熔斷、健檢、v4.3/v4.4/v4.5 升級與三幣核心邏輯）
-.venv/bin/pytest -q test_live_sizing_risk.py test_daily_review.py test_upgrades_v43.py test_upgrades_v44.py test_upgrades_v45.py
+# 執行全部根目錄測試（含 v5.1 E4 雙源共識、官方預言機守門、分幣種費率與 VPN 看門狗）
+.venv/bin/pytest -q test_*.py
 (cd polymarket-btc-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-eth-5m && ../.venv/bin/pytest -q tests/)
 (cd polymarket-sol-5m && ../.venv/bin/pytest -q tests/)

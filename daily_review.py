@@ -18,6 +18,7 @@ from dotenv import dotenv_values
 import requests
 
 COINS: tuple[str, ...] = ("btc", "eth", "sol")
+SCOUT_COINS: tuple[str, ...] = ("xrp", "doge")
 TZ_TAIPEI = timezone(timedelta(hours=8))
 GEOBLOCK_URL = "https://polymarket.com/api/geoblock"
 TG_SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
@@ -455,9 +456,33 @@ def run_daily_review(
         "z_buckets": {k: asdict(v) for k, v in z_buckets.items()},
         "slippage_summary": slippage_summary,
         "shared_risk": shared_risk,
+        "paper_scouts": _collect_paper_scouts(root, cutoff_ts),
         "wallet_geo": wallet_geo,
         "watchlist": watchlist,
     }
+
+
+def _collect_paper_scouts(root: Path, cutoff_ts: float = 0.0) -> list[dict[str, Any]]:
+    """Collect read-only paper scout stats for XRP/DOGE when their SQLite DBs exist."""
+    scouts: list[dict[str, Any]] = []
+    for coin in SCOUT_COINS:
+        db_path = root / f"polymarket-{coin}-5m" / "data" / f"live_{coin}_5m.db"
+        if not db_path.exists():
+            continue
+        cdb, _, _ = _audit_coin_db(db_path, cutoff_ts)
+        st = cdb["all_time"]
+        scouts.append(
+            {
+                "coin": coin.upper(),
+                "windows": cdb["windows"],
+                "trades": st["trades"],
+                "wins": st["wins"],
+                "losses": st["losses"],
+                "win_rate_pct": st["win_rate_pct"],
+                "net_pnl_usdc": st["net_pnl_usdc"],
+            }
+        )
+    return scouts
 
 
 def _fmt_ms(val: float | None) -> str:
@@ -543,6 +568,16 @@ def render_markdown_report(report: dict[str, Any]) -> str:
     lines.extend(["", "## 5. 漸進微調觀察清單（維持原技術基底、不爆改）"])
     for item in report["watchlist"]:
         lines.append(f"- {item}")
+
+    scouts = report.get("paper_scouts") or []
+    if scouts:
+        lines.extend(["", "## 6. Paper Scouts (`XRP` / `DOGE`)"])
+        for sc in scouts:
+            sc_wr = f"{sc['win_rate_pct']:.1f}%" if sc["win_rate_pct"] is not None else "--"
+            lines.append(
+                f"- **{sc['coin']} (Paper)**: `windows={sc['windows']}` ｜ "
+                f"`{sc['wins']}W-{sc['losses']}L` ({sc_wr}) ｜ `{sc['net_pnl_usdc']:+.2f} USDC`"
+            )
     return "\n".join(lines) + "\n"
 
 

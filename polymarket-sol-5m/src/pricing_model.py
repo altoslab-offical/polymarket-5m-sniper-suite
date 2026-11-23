@@ -80,6 +80,9 @@ class FairValueEstimate:
     p_true_up: float            # Estimated probability Chainlink S_T >= Chainlink S_0
     p_true_down: float          # 1.0 - p_true_up
     cvd_imbalance: float = 0.0  # [-1.0, +1.0], aggressive market-order volume delta (un-spoofable)
+    bn_raw_z: Optional[float] = None
+    bn_p_true_up: Optional[float] = None
+    bn_p_true_down: Optional[float] = None
 
 
 class RollingMicrostructureTracker:
@@ -96,6 +99,7 @@ class RollingMicrostructureTracker:
         self._ewma_obi: float = 0.0
         self._obi_initialized: bool = False
         self._ewma_basis_bps: Optional[float] = None  # Rolling USDT/USD structural basis (CEX vs Chainlink)
+        self._basis_60s: Deque[Tuple[int, float]] = deque(maxlen=65)
 
     def update_oracle_basis(self, chainlink_price: Optional[float], cex_price: Optional[float]) -> float:
         """
@@ -111,6 +115,34 @@ class RollingMicrostructureTracker:
         alpha = 0.015
         self._ewma_basis_bps = alpha * raw_bps + (1.0 - alpha) * self._ewma_basis_bps
         return raw_bps - self._ewma_basis_bps
+
+    def record_basis_sample(
+        self,
+        ts: float,
+        binance_price: Optional[float],
+        chainlink_price: Optional[float],
+    ) -> None:
+        """Record causal 1Hz `(binance - chainlink)` dollar basis sample for E4 60s mean."""
+        if not binance_price or not chainlink_price or binance_price <= 0 or chainlink_price <= 0:
+            return
+        sec = int(ts)
+        basis = float(binance_price) - float(chainlink_price)
+        if self._basis_60s and self._basis_60s[-1][0] == sec:
+            self._basis_60s[-1] = (sec, basis)
+        elif not self._basis_60s or sec > self._basis_60s[-1][0]:
+            self._basis_60s.append((sec, basis))
+        cutoff = sec - 59
+        while self._basis_60s and self._basis_60s[0][0] < cutoff:
+            self._basis_60s.popleft()
+
+    def mean_basis_60s(self, now_ts: float) -> Optional[float]:
+        """Return causal 60s mean `(binance - chainlink)` basis when >= 10 samples exist."""
+        cutoff = int(now_ts) - 59
+        while self._basis_60s and self._basis_60s[0][0] < cutoff:
+            self._basis_60s.popleft()
+        if len(self._basis_60s) < 10:
+            return None
+        return sum(v for _, v in self._basis_60s) / len(self._basis_60s)
 
     def on_price(self, ts: float, price: float) -> None:
         if price <= 0:
@@ -191,7 +223,7 @@ class RollingMicrostructureTracker:
         sell_vol = sum(notional for _, notional, s in self._trades if s < 0)
         total_vol = buy_vol + sell_vol
         cvd_imb = ((buy_vol - sell_vol) / total_vol) if total_vol > 1000.0 else 0.0
-        combined = 0.70 * cvd_imb + 0.30 * self._ewma_obi
+        combined = cvd_imb
         return cvd_imb, self._ewma_obi, max(-1.0, min(1.0, combined))
 
 
@@ -242,6 +274,70 @@ def estimate_fair_value(
         chainlink_price=chainlink_price,
         cex_lead_price=cex_lead_price,
         oracle_gap_bps=oracle_gap_bps,
+        remaining_sec=remaining_sec,
+        vol_1s=vol_1s,
+        horizon_vol_pct=horizon_vol * 100.0,
+        raw_z_score=raw_z,
+        adjusted_z_score=adjusted_z,
+        orderflow_score=orderflow_score,
+        p_true_up=p_up,
+        p_true_down=1.0 - p_up,
+        cvd_imbalance=cvd_imbalance,
+    )
+
+
+def estimate_twap_fair_value(
+    strike_price: float,
+    chainlink_price: float,
+    remaining_sec: float,
+    vol_1s: float,
+    orderflow_score: float = 0.0,
+    cex_lead_price: Optional[float] = None,
+    dynamic_gap_bps: Optional[float] = None,
+    cvd_imbalance: float = 0.0,
+    realized_240: Tuple[Optional[float], float] = (None, 0.0),
+    twap_gaussian_weight: float = 0.70,
+    twap_student_t_df: float = 6.0,
+) -> Optional[FairValueEstimate]:
+    """
+    Analytical probability that final 60s Chainlink TWAP [T+240..T+300] settles >= `strike_price`.
+    Accounts for variance reduction of averaging (rem - 40s for rem > 60s, Brownian bridge for rem <= 60s).
+    """
+    if strike_price <= 0 or chainlink_price <= 0:
+        return None
+
+    rem = max(0.5, remaining_sec)
+    vol = max(1e-7, vol_1s)
+    if rem > 60.0:
+        eff_tau = max(1.0, rem - 40.0)
+        horizon_vol = vol * math.sqrt(eff_tau)
+        raw_z = ((chainlink_price - strike_price) / strike_price) / horizon_vol
+    else:
+        realized_mean, realized_elapsed = realized_240
+        a = max(0.0, min(59.5, realized_elapsed))
+        mean_src = realized_mean if (realized_mean and realized_mean > 0) else chainlink_price
+        mean_twap = (a * mean_src + rem * chainlink_price) / max(1e-6, a + rem)
+        horizon_vol = max(1e-7, (rem / 60.0) * vol * math.sqrt(rem / 3.0))
+        raw_z = ((mean_twap - strike_price) / strike_price) / horizon_vol
+
+    if dynamic_gap_bps is not None:
+        gap_bps = dynamic_gap_bps
+    elif cex_lead_price is not None and cex_lead_price > 0:
+        gap_bps = ((cex_lead_price - chainlink_price) / chainlink_price) * 10000.0
+    else:
+        gap_bps = 0.0
+
+    drift_z_adj = 0.05 * max(-1.0, min(1.0, orderflow_score))
+    adjusted_z = raw_z + drift_z_adj
+    gw = max(0.0, min(1.0, twap_gaussian_weight))
+    p_blend = gw * normal_cdf(adjusted_z) + (1.0 - gw) * fat_tail_prob_from_z(adjusted_z, df=twap_student_t_df)
+    p_up = max(0.005, min(0.995, p_blend))
+
+    return FairValueEstimate(
+        strike_price=strike_price,
+        chainlink_price=chainlink_price,
+        cex_lead_price=cex_lead_price,
+        oracle_gap_bps=gap_bps,
         remaining_sec=remaining_sec,
         vol_1s=vol_1s,
         horizon_vol_pct=horizon_vol * 100.0,

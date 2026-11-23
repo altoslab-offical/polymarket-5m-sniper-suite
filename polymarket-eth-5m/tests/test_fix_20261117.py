@@ -11,15 +11,22 @@ from src.strategy import HighProbSniperStrategy, OrderBookTop
 
 
 def _fv(strike, cl, remaining):
-    return estimate_fair_value(strike_price=strike, chainlink_price=cl, remaining_sec=remaining,
-                               vol_1s=0.00005, orderflow_score=0.0, dynamic_gap_bps=0.0)
+    fv = estimate_fair_value(strike_price=strike, chainlink_price=cl, remaining_sec=remaining,
+                             vol_1s=0.00005, orderflow_score=0.0, dynamic_gap_bps=0.0)
+    assert fv is not None
+    fv.bn_raw_z = fv.raw_z_score
+    fv.bn_p_true_up = fv.p_true_up
+    fv.bn_p_true_down = fv.p_true_down
+    return fv
 
 
 class TestFix20261117(unittest.TestCase):
     def test_defaults(self):
-        self.assertFalse(DEFAULT_CONFIG.skip_book_calibrated_windows)
-        self.assertAlmostEqual(DEFAULT_CONFIG.min_1s_vol_floor, 0.000070, places=7)
+        self.assertTrue(DEFAULT_CONFIG.skip_book_calibrated_windows)
+        self.assertTrue(DEFAULT_CONFIG.require_official_oracle_strike)
+        self.assertAlmostEqual(DEFAULT_CONFIG.min_1s_vol_floor, 0.000035, places=7)
         self.assertFalse(DEFAULT_CONFIG.enable_book_stop)
+        self.assertTrue(DEFAULT_CONFIG.e4_dual_consensus)
 
     def test_single_instance_lock_blocks_duplicate_monitor(self):
         with tempfile.TemporaryDirectory() as tmp:

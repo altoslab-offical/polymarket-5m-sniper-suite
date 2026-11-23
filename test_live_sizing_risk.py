@@ -138,10 +138,14 @@ def test_strategy_proportional_sizing_works_across_all_three_coins(coin_dir: str
         p_true_down=0.10,
         orderflow_score=0.5,
         cvd_imbalance=0.3,
+        bn_raw_z=1.80,
+        bn_p_true_up=0.90,
+        bn_p_true_down=0.10,
     )
     book = OrderBookTop(up_bid=0.77, up_ask=0.78, down_bid=0.21, down_ask=0.22)
     action = strat.evaluate_tick(ts=1795219400.0, window_ts=1795219200, elapsed_sec=200.0, fv=fv, book=book)
     assert action is not None and action.startswith("[ENTRY UP]")
     assert strat.active_position is not None
-    # Cost per share at 0.78 + 0.07*0.78*0.22 = 0.79201 -> $4.253 / 0.79201 = 5.37 sh
-    assert strat.active_position.shares == pytest.approx(5.37, abs=0.02)
+    # BTC fee=0.05 (0.78858/sh -> 5.39 sh); ETH/SOL fee=0.01 (0.78172/sh -> 5.44 sh)
+    expected_sh = 5.39 if "btc" in coin_dir else 5.44
+    assert strat.active_position.shares == pytest.approx(expected_sh, abs=0.02)

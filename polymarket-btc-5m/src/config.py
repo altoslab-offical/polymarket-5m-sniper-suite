@@ -8,7 +8,7 @@ from dataclasses import dataclass
 class StrategyConfig:
     # --- Polymarket Window & Fee Mechanics ---
     window_seconds: int = 300               # 5-minute candles (288 windows/day)
-    crypto_taker_fee_rate: float = 0.07     # Fee = C * 0.07 * p * (1 - p)
+    crypto_taker_fee_rate: float = 0.05     # Fee = C * 0.05 * p * (1 - p) [Polymarket crypto_btc_5m_15m_fees]
     maker_rebate_share: float = 0.20        # 20% of taker fee pool redistributed to makers
 
     # --- Entry Window (Calibrated on 400+ live Polymarket 5m windows) ---
@@ -17,7 +17,7 @@ class StrategyConfig:
     entry_end_elapsed_sec: float = 255.0    # Stop new entries at 4m15s elapsed (45s left)
 
     # --- High-Probability Spatial Cushion & Pricing Filters ---
-    min_z_score: float = 1.30               # |Delta S| / (sigma * sqrt(tau)) >= 1.30
+    min_z_score: float = 1.30               # E4 dual-consensus |Z_CL| & |Z_BN| >= 1.30 (aligned w/ Phase 4.2 frozen_config)
     min_true_prob: float = 0.80             # Model fat-tail win prob must be >= 80%
     min_entry_price: float = 0.68           # Avoid low-conviction chop
     max_entry_price: float = 0.82           # Cap <= $0.82 (~$0.83 w/ fee) to prevent 6.5:1 adverse payoff skew
@@ -28,12 +28,17 @@ class StrategyConfig:
     # --- Strike (Price-to-Beat) Uncertainty Guard [2026-11-18 consensus] ---
     # 跨日重播驗證 (1,413 盤): BOOK_CALIBRATED 在開盤預言機有 2-5 秒延遲時，與官方結算一致率高於 t=0 RTDS
     # (93.1% vs 88.8%)；保留校正且不跳過校準盤表現最佳 (64 筆、勝率 90.6%、總損益 +182.60 U)。
-    skip_book_calibrated_windows: bool = False
+    skip_book_calibrated_windows: bool = True
+    require_official_oracle_strike: bool = True  # v5.1: Enforce OFFICIAL_TWAP60 / GAMMA_OFFICIAL strike only
 
     # --- Heavy-Tail / Volatility Calibration ---
     student_t_df: float = 4.5               # Degrees of freedom for BTC 5m fat-tail jumps
-    vol_lookback_sec: int = 180             # 3-minute rolling 1s realized volatility window
-    min_1s_vol_floor: float = 0.000060      # ~34% annualized floor (1,988-window replay: n=59, WR=94.9%, +279.81 U, PF=4.73, SL=0)
+    vol_lookback_sec: int = 1800            # 30-minute rolling 1s Binance close realized vol (Phase 4.2 parity)
+    min_1s_vol_floor: float = 0.000035      # Phase 4.2 v2_filtered vol floor
+    use_twap_projection: bool = True        # Exact 60s TWAP variance-reduction & final-60s integral
+    twap_gaussian_weight: float = 0.70      # Blend weight on Gaussian CDF in TWAP projection
+    twap_student_t_df: float = 6.0          # Student-t tail df for TWAP projection
+    e4_dual_consensus: bool = True          # Phase 4.2 E4: min(|z_CL|, |z_BN_adj|) >= min_z_score
 
     # --- CEX Orderflow & Chainlink Oracle-Gap Confirmation ---
     cvd_window_sec: int = 20                # 20-second Cumulative Volume Delta lookback

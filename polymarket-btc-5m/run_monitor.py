@@ -14,7 +14,7 @@ from pathlib import Path
 import shutil
 import sys
 import time
-from typing import Optional
+from typing import Any, Callable, Optional
 import unicodedata
 
 _SHARED_ROOT = Path(__file__).resolve().parent.parent
@@ -27,9 +27,9 @@ from src.config import DEFAULT_CONFIG, StrategyConfig
 from src.fees import effective_exit_proceeds, taker_fee_per_share
 from src.feeds import LiveMarketHub, fetch_5m_market_metadata
 from src.live_executor import LiveFillResult, PolymarketLiveExecutor
-from src.pricing_model import RollingMicrostructureTracker, estimate_fair_value
+from src.pricing_model import RollingMicrostructureTracker, estimate_fair_value, estimate_twap_fair_value
 from src.storage import MarketDataStorage
-from src.strategy import HighProbSniperStrategy, Position
+from src.strategy import ClosedTrade, HighProbSniperStrategy, Position
 from src.tg_notifier import TelegramBotService
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -60,6 +60,74 @@ def _setup_event_logger(coin: str, log_file: str) -> Optional[logging.Logger]:
     return logger
 
 
+def _handle_feed_health_alerts(
+    feed_silences: tuple[tuple[str, float], ...],
+    now_wall: float,
+    last_feed_log_ts: dict[str, float],
+    last_feed_tg_ts: dict[str, float],
+    local_active_alerts: dict[str, float],
+    emit_fn: Any,
+    tg: Any,
+    shared_risk: Any,
+    log_threshold_sec: float = 15.0,
+    tg_threshold_sec: float = 30.0,
+    log_cooldown_sec: float = 300.0,
+    tg_cooldown_sec: float = 1800.0,
+) -> None:
+    """Emit local feed warnings at 15s and cross-coin deduped Telegram outage/recovery alerts at 30s."""
+    for f_name, f_sil in feed_silences:
+        if f_sil > log_threshold_sec and (now_wall - last_feed_log_ts.get(f_name, 0.0)) >= log_cooldown_sec:
+            last_feed_log_ts[f_name] = now_wall
+            emit_fn(f"[FEED WARN] {f_name} silent={f_sil:.1f}s (>{log_threshold_sec:.0f}s)")
+        if f_sil >= tg_threshold_sec:
+            if shared_risk is not None:
+                should_send = shared_risk.claim_alert(
+                    f"feed:{f_name}", cooldown_sec=tg_cooldown_sec, mark_active=True, now_ts=now_wall
+                )
+            else:
+                should_send = (now_wall - last_feed_tg_ts.get(f_name, 0.0)) >= tg_cooldown_sec
+                if should_send:
+                    last_feed_tg_ts[f_name] = now_wall
+                    local_active_alerts[f_name] = now_wall
+            if should_send and tg.enabled and tg.get_recipient_ids():
+                tg.notify_alert(
+                    f"資料源斷線超過 {tg_threshold_sec:.0f} 秒",
+                    f"{f_name} 已連續靜默 {f_sil:.1f} 秒（跨幣去重告警），請檢查網路或 VPN。",
+                )
+        elif f_sil < 5.0:
+            if shared_risk is not None:
+                dur = shared_risk.resolve_alert(f"feed:{f_name}", now_ts=now_wall)
+            else:
+                started = local_active_alerts.pop(f_name, None)
+                dur = max(0.0, now_wall - started) if started is not None else None
+            if dur is not None:
+                emit_fn(f"[FEED RECOVERED] {f_name} recovered after ~{dur:.0f}s")
+                if tg.enabled and tg.get_recipient_ids():
+                    tg.notify_alert(
+                        "資料源已恢復",
+                        f"✅ {f_name} 已恢復即時串流（告警後約 {dur:.0f} 秒恢復）。",
+                    )
+
+
+def _fetch_startup_wallet_position(
+    up_token: str,
+    down_token: str,
+    live_exec: PolymarketLiveExecutor,
+    window_ts: int,
+) -> Optional[tuple[str, float, str, float]]:
+    """Fetch conditional wallet balances and fill price off-thread (zero SQLite calls)."""
+    up_bal = live_exec.sync_conditional_balance(up_token)
+    dn_bal = live_exec.sync_conditional_balance(down_token)
+    if up_bal >= 0.5:
+        side, shares, token_id = "UP", up_bal, up_token
+    elif dn_bal >= 0.5:
+        side, shares, token_id = "DOWN", dn_bal, down_token
+    else:
+        return None
+    _, tr_px = live_exec.lookup_recent_buy_fill(token_id, float(window_ts) - 5.0)
+    return side, shares, token_id, tr_px
+
+
 def reconcile_startup_position(
     window_ts: int,
     elapsed_sec: float,
@@ -72,16 +140,16 @@ def reconcile_startup_position(
     now_ts: float,
     up_mid_fallback: Optional[float] = None,
     down_mid_fallback: Optional[float] = None,
+    prefetched: Optional[tuple[str, float, str, float]] = None,
 ) -> Optional[int]:
-    """Inspect conditional wallet balances at startup and adopt any live 5m position into strategy state."""
-    up_bal = live_exec.sync_conditional_balance(up_token)
-    dn_bal = live_exec.sync_conditional_balance(down_token)
-    if up_bal >= 0.5:
-        side, shares, token_id, mid_fb = "UP", up_bal, up_token, up_mid_fallback
-    elif dn_bal >= 0.5:
-        side, shares, token_id, mid_fb = "DOWN", dn_bal, down_token, down_mid_fallback
-    else:
+    """Adopt any live 5m wallet position into SQLite & strategy state on the main thread."""
+    fetched = prefetched if prefetched is not None else _fetch_startup_wallet_position(
+        up_token, down_token, live_exec, window_ts
+    )
+    if fetched is None:
         return None
+    side, shares, token_id, tr_px = fetched
+    mid_fb = up_mid_fallback if side == "UP" else down_mid_fallback
 
     db_row = storage.conn.execute(
         """
@@ -94,7 +162,6 @@ def reconcile_startup_position(
         (window_ts,),
     ).fetchone()
 
-    _, tr_px = live_exec.lookup_recent_buy_fill(token_id, float(window_ts) - 5.0)
     if tr_px > 0.0:
         entry_px = tr_px
     elif db_row and db_row[1] == side and float(db_row[5] or 0.0) > 0.0:
@@ -172,6 +239,7 @@ async def resolve_official_polymarket_outcome(
     tg: Optional[TelegramBotService] = None,
     shared_risk: Optional[SharedDailyRiskGuard] = None,
     event_logger: Optional[logging.Logger] = None,
+    tg_commands_only: bool = False,
 ) -> None:
     """
     Wait ~6-15s in background after 5m close to verify Polymarket Gamma API's OFFICIAL settled
@@ -256,7 +324,7 @@ async def resolve_official_polymarket_outcome(
                 last.net_pnl_usdc,
                 last.won,
             )
-            if tg is not None and tg.enabled:
+            if tg is not None and tg.enabled and not tg_commands_only:
                 tg.notify_exit(
                     trade_id=active_db_trade_id,
                     side=last.side,
@@ -268,11 +336,11 @@ async def resolve_official_polymarket_outcome(
                     entry_price=last.entry_price,
                     live_mode=(live_exec is not None),
                 )
-                if live_exec is not None and live_exec.circuit_broken:
-                    tg.notify_alert(
-                        "實盤風控熔斷觸發",
-                        f"今日實盤累計虧損已達上限 (-${live_exec.max_daily_loss_usdc:.1f} pUSD)，已自動停止開新倉！",
-                    )
+            if tg is not None and tg.enabled and live_exec is not None and live_exec.circuit_broken:
+                tg.notify_alert(
+                    "實盤風控熔斷觸發",
+                    f"今日實盤累計虧損已達上限 (-${live_exec.max_daily_loss_usdc:.1f} pUSD)，已自動停止開新倉！",
+                )
         if live_exec is not None:
             try:
                 fresh_bal = await loop.run_in_executor(None, live_exec.get_pusd_balance)
@@ -297,9 +365,9 @@ async def resolve_official_polymarket_outcome(
 
 
 async def _bg_prefetch_cond_balance(live_exec: PolymarketLiveExecutor, token_id: str) -> None:
-    """Retry conditional token balance sync (4s/8s/13s) until Polygon settlement completes."""
+    """Retry conditional token balance sync (2s/5s/9s/14s) until Polygon settlement completes."""
     loop = asyncio.get_running_loop()
-    for wait_s in (4.0, 4.0, 5.0):
+    for wait_s in (2.0, 3.0, 4.0, 5.0):
         await asyncio.sleep(wait_s)
         avail = await loop.run_in_executor(None, live_exec.sync_conditional_balance, token_id)
         if avail > 0.0:
@@ -311,9 +379,86 @@ async def _bg_warmup_window(
     up_token: Optional[str],
     down_token: Optional[str],
 ) -> None:
-    """Pre-warm CLOB V2 market metadata & HTTP/2 socket in background so sniper orders fire in ~150ms instead of ~4.1s."""
+    """Pre-warm CLOB V2 market metadata & HTTP/2 socket in background so sniper orders fire in 1 RTT."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, live_exec.warmup_tokens, up_token, down_token)
+
+
+async def _bg_sync_balance(
+    live_exec: PolymarketLiveExecutor,
+    strategy: HighProbSniperStrategy,
+    hub: LiveMarketHub,
+    tg: TelegramBotService,
+    shared_risk: Optional[SharedDailyRiskGuard],
+    bet_pct: float,
+) -> None:
+    """Refresh pUSD balance asynchronously so hot-zone tick evaluation never stalls."""
+    try:
+        fresh_bal = await asyncio.get_running_loop().run_in_executor(None, live_exec.get_pusd_balance)
+        if bet_pct > 0.0:
+            strategy.bankroll = fresh_bal
+            hub.target_usdc = max(4.5, round(fresh_bal * bet_pct, 2))
+            tg.bet_usdc = max(4.2, round(fresh_bal * bet_pct, 2))
+        if shared_risk is not None and fresh_bal > 0.0:
+            shared_risk.sync_day_equity(fresh_bal)
+            shared_risk.record_balance(fresh_bal)
+    except Exception as exc:
+        sys.stderr.write(f"[BAL SYNC WARN] {exc}\n")
+
+
+def _commit_live_exit_accounting(
+    *,
+    last: ClosedTrade,
+    final_leg_pnl: float,
+    now_ts: float,
+    active_db_trade_id: int,
+    live_exec: Optional[PolymarketLiveExecutor],
+    shared_risk: Optional[SharedDailyRiskGuard],
+    strategy: HighProbSniperStrategy,
+    storage: MarketDataStorage,
+    tg: TelegramBotService,
+    live_mode: bool,
+    emit_fn: Callable[[str], None],
+    tg_commands_only: bool = False,
+) -> None:
+    """Persist realized PnL, shared daily risk state, SQLite trade close, and Telegram exit alert."""
+    if live_exec is not None:
+        live_exec.record_realized_pnl(final_leg_pnl)
+        if shared_risk is not None:
+            r_state = shared_risk.record_pnl(final_leg_pnl, current_equity=strategy.bankroll)
+            live_exec.daily_pnl_usdc = float(r_state["daily_realized_pnl_usdc"])
+            live_exec.max_daily_loss_usdc = float(r_state["max_daily_loss_usdc"])
+            live_exec.circuit_broken = bool(r_state["circuit_broken"])
+        if live_exec.circuit_broken:
+            emit_fn(
+                f"🛑 [風控熔斷] 今日實盤累計虧損已達上限 "
+                f"(-${live_exec.max_daily_loss_usdc:.1f})，已自動停止新開倉！"
+            )
+    storage.close_paper_trade(
+        active_db_trade_id,
+        now_ts,
+        last.exit_reason,
+        last.exit_payout_per_share,
+        last.net_pnl_usdc,
+        last.won,
+    )
+    if tg.enabled and not tg_commands_only:
+        tg.notify_exit(
+            trade_id=active_db_trade_id,
+            side=last.side,
+            window_ts=last.window_ts,
+            exit_reason=last.exit_reason,
+            net_pnl_usdc=last.net_pnl_usdc,
+            won=last.won,
+            exit_payout_per_share=last.exit_payout_per_share,
+            entry_price=last.entry_price,
+            live_mode=live_mode,
+        )
+    if tg.enabled and live_exec is not None and live_exec.circuit_broken:
+        tg.notify_alert(
+            "實盤風控熔斷觸發",
+            f"今日實盤累計虧損已達上限 (-${live_exec.max_daily_loss_usdc:.1f} pUSD)，已自動停止開新倉！",
+        )
 
 
 def _acquire_single_instance_lock(db_path: str):
@@ -353,6 +498,7 @@ async def monitor_loop(
     bet_pct: float = 0.0,
     max_daily_loss_pct: float = 0.0,
     log_file: str = "",
+    tg_commands_only: bool = False,
 ) -> None:
     instance_lock = _acquire_single_instance_lock(db_path)
     event_logger = _setup_event_logger("BTC", log_file)
@@ -447,7 +593,7 @@ async def monitor_loop(
     else:
         print(" 📱 Telegram 監控 : 未設定 TG_BOT_TOKEN (可隨時執行 python tg_bot.py 設定)")
     print("=" * 98)
-    _emit(f"[BOOT] Polymarket BTC 5m v4.5 | {mode_tag} | bankroll=${bankroll:,.2f}")
+    _emit(f"[BOOT] Polymarket BTC 5m v5.1 | {mode_tag} | bankroll=${bankroll:,.2f}")
 
     feed_task = asyncio.create_task(hub.start())
     loop_init = asyncio.get_running_loop()
@@ -458,40 +604,57 @@ async def monitor_loop(
             f"eff_offset_ms={hub.chainlink.effective_clock_offset_ms:+.1f}ms"
         )
         if abs(hub.chainlink.raw_clock_offset_ms) > 250.0 and tg.enabled and tg.get_recipient_ids():
-            tg.notify_alert(
-                "系統時鐘偏差警告",
-                f"本機時鐘偏差達 {hub.chainlink.raw_clock_offset_ms:+.1f}ms (>250ms)，已啟動毫秒補償，建議同步 OS NTP。",
-            )
+            if shared_risk is None or shared_risk.claim_alert("clock:skew", cooldown_sec=3600.0):
+                tg.notify_alert(
+                    "系統時鐘偏差警告",
+                    f"本機時鐘偏差達 {hub.chainlink.raw_clock_offset_ms:+.1f}ms (>250ms)，已啟動毫秒補償，建議同步 OS NTP。",
+                )
 
     tg_task: Optional[asyncio.Task] = None
     if tg.enabled:
         tg_task = asyncio.create_task(tg.poll_loop(poll_commands=True, watch_db_changes=False))
         if tg.chat_id:
-            tg.send_async(
-                f"<b>[BTC | SYSTEM ONLINE // {'LIVE 實盤狙擊' if live_mode else 'PAPER 模擬監控'}]</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n"
-                f"▸ <b>單筆規模</b>：<b>{tg_bet_desc}</b>\n"
-                f"▸ <b>單日熔斷</b>：<b>{tg_risk_desc}</b>"
-            )
+            if tg_commands_only and not live_mode:
+                tg.send_async(
+                    "<b>[BTC | SYSTEM ONLINE // PAPER 觀察 + TG 控制台]</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "▸ <b>實盤模式</b>：<b>專注 ETH / SOL</b> (BTC 僅模擬觀察，不推送模擬成交)"
+                )
+            else:
+                tg.send_async(
+                    f"<b>[BTC | SYSTEM ONLINE // {'LIVE 實盤狙擊' if live_mode else 'PAPER 模擬監控'}]</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"▸ <b>單筆規模</b>：<b>{tg_bet_desc}</b>\n"
+                    f"▸ <b>單日熔斷</b>：<b>{tg_risk_desc}</b>"
+                )
     prev_window_ts: Optional[int] = None
     prev_strike: Optional[float] = None
     last_up_bid: Optional[float] = None
     last_down_bid: Optional[float] = None
     active_db_trade_id: Optional[int] = None
     last_live_attempt_ts: float = 0.0
+    last_live_attempt_cooldown: float = 5.0
     last_warmup_ts: float = 0.0
     last_ka_dispatch_ts: float = 0.0
     last_bal_sync_ts: float = time.time()
+    bal_sync_task: Optional[asyncio.Task] = None
     last_1hz_ts: float = 0.0
     dyn_gap_bps: float = 0.0
     is_tg_paused: bool = False
     consecutive_loop_errors: int = 0
     startup_reconciled: bool = live_exec is None
     reconcile_in_flight: bool = False
+    maker_tp_order_id: str = ""
+    maker_tp_token: str = ""
+    maker_tp_placed_window: int = 0
+    last_maker_check_ts: float = 0.0
+    maker_tp_inflight: bool = False
     monitor_start_ts: float = time.time()
     last_seen_clock_sync_ts: float = hub.chainlink._precise_clock_synced_ts
     last_clock_warn_ts: float = time.time() if abs(hub.chainlink.raw_clock_offset_ms) > 250.0 else 0.0
     last_feed_warn_ts: dict[str, float] = {}
+    last_feed_tg_ts: dict[str, float] = {}
+    local_active_feed_alerts: dict[str, float] = {}
     bg_tasks: set[asyncio.Task] = set()
 
     try:
@@ -514,21 +677,14 @@ async def monitor_loop(
                 if is_1hz_tick:
                     last_1hz_ts = now
 
-                if live_exec is not None and (now - last_bal_sync_ts) >= 20.0:
+                if live_exec is not None and (now - last_bal_sync_ts) >= 15.0:
                     last_bal_sync_ts = now
-                    if bet_pct > 0.0:
-                        try:
-                            fresh_bal = await asyncio.get_running_loop().run_in_executor(
-                                None, live_exec.get_pusd_balance
-                            )
-                            strategy.bankroll = fresh_bal
-                            hub.target_usdc = max(4.5, round(fresh_bal * bet_pct, 2))
-                            tg.bet_usdc = max(4.2, round(fresh_bal * bet_pct, 2))
-                            if shared_risk is not None and fresh_bal > 0.0:
-                                shared_risk.sync_day_equity(fresh_bal)
-                                shared_risk.record_balance(fresh_bal)
-                        except Exception:
-                            pass
+                    if bal_sync_task is None or bal_sync_task.done():
+                        bal_sync_task = asyncio.create_task(
+                            _bg_sync_balance(live_exec, strategy, hub, tg, shared_risk, bet_pct)
+                        )
+                        bg_tasks.add(bal_sync_task)
+                        bal_sync_task.add_done_callback(bg_tasks.discard)
                     if shared_risk is not None:
                         broken, dpnl, dcap = shared_risk.is_broken()
                         live_exec.daily_pnl_usdc = dpnl
@@ -557,6 +713,20 @@ async def monitor_loop(
 
                 # Trigger non-blocking official Gamma + Chainlink settlement verification on rollover
                 if prev_window_ts is not None and window_ts != prev_window_ts:
+                    if live_exec is not None and maker_tp_order_id:
+                        _cancel_oid = maker_tp_order_id
+                        _ct = asyncio.create_task(
+                            asyncio.get_running_loop().run_in_executor(
+                                None, live_exec.cancel_order_safe, _cancel_oid
+                            )
+                        )
+                        bg_tasks.add(_ct)
+                        _ct.add_done_callback(bg_tasks.discard)
+                    maker_tp_order_id = ""
+                    maker_tp_token = ""
+                    maker_tp_placed_window = 0
+                    last_maker_check_ts = 0.0
+                    maker_tp_inflight = False
                     hs = hub.health.snapshot_dict(hub.chainlink)
                     _emit(
                         f"[HEALTH] window={prev_window_ts} | cl_src={cl.source} | "
@@ -567,6 +737,15 @@ async def monitor_loop(
                         f"reconn(clob={hs['clob_reconn']},rtds={hs['rtds_reconn']},pb={hs['polybolt_reconn']},bn={hs['bn_reconn']},cb={hs['cb_reconn']}) | "
                         f"stale_skips={hs['stale_skips']} | clock_raw_ms={hs['clock_raw_ms']:+.1f} clock_eff_ms={hs['clock_eff_ms']:+.1f}"
                     )
+                    settle_close = (
+                        cl.official_twap_60s
+                        if (
+                            cl.official_twap_60s is not None
+                            and cl.official_twap_recv_ts > 0.0
+                            and (time.time() - cl.official_twap_recv_ts) < 10.0
+                        )
+                        else cl.settlement_reference_price
+                    )
                     t = asyncio.create_task(
                         resolve_official_polymarket_outcome(
                             hub=hub,
@@ -574,7 +753,7 @@ async def monitor_loop(
                             strategy=strategy,
                             prev_window_ts=prev_window_ts,
                             prev_strike=prev_strike,
-                            cl_close=cl.settlement_reference_price,
+                            cl_close=settle_close,
                             last_up_bid=last_up_bid,
                             last_down_bid=last_down_bid,
                             active_db_trade_id=active_db_trade_id,
@@ -582,6 +761,7 @@ async def monitor_loop(
                             tg=tg,
                             shared_risk=shared_risk,
                             event_logger=event_logger,
+                            tg_commands_only=tg_commands_only,
                         )
                     )
                     bg_tasks.add(t)
@@ -602,20 +782,31 @@ async def monitor_loop(
                 ):
                     reconcile_in_flight = True
                     try:
-                        rec_id = await asyncio.get_running_loop().run_in_executor(
+                        prefetched = await asyncio.get_running_loop().run_in_executor(
                             None,
-                            reconcile_startup_position,
-                            window_ts,
-                            elapsed,
+                            _fetch_startup_wallet_position,
                             st.up_token,
                             st.down_token,
                             live_exec,
-                            storage,
-                            strategy,
-                            cfg,
-                            now,
-                            st.book.up_ask,
-                            st.book.down_ask,
+                            window_ts,
+                        )
+                        rec_id = (
+                            reconcile_startup_position(
+                                window_ts,
+                                elapsed,
+                                st.up_token,
+                                st.down_token,
+                                live_exec,
+                                storage,
+                                strategy,
+                                cfg,
+                                now,
+                                st.book.up_ask,
+                                st.book.down_ask,
+                                prefetched=prefetched,
+                            )
+                            if prefetched is not None
+                            else None
                         )
                         if rec_id is not None and strategy.active_position is not None:
                             active_db_trade_id = rec_id
@@ -644,6 +835,8 @@ async def monitor_loop(
                     last_down_bid = 0.0
 
                 cl_spot = cl.settlement_reference_price
+                if cl_spot is not None and elapsed >= 240.0:
+                    st.record_twap240_spot(now, cl_spot)
                 cex_lead = st.cex_lead_price
                 vol_1s = tracker.get_realized_vol_1s(floor=cfg.min_1s_vol_floor)
                 cvd_imb, obi, flow_score = tracker.get_orderflow_metrics(now)
@@ -659,6 +852,15 @@ async def monitor_loop(
                             strategy.traded_windows.add(window_ts)
                             print(f"⏭️  [基準價不確定] {window_ts} 盤口與 Chainlink 基準價分歧，本盤不開新倉")
                     dyn_gap_bps = tracker.update_oracle_basis(cl_spot, cex_lead)
+                    if (
+                        st.binance_price is not None
+                        and st.binance_price > 0.0
+                        and (now - st.binance_ts) <= 5.0
+                        and cl_spot is not None
+                        and cl_spot > 0.0
+                        and cl.is_alive(max_silence_sec=5.0)
+                    ):
+                        tracker.record_basis_sample(now, st.binance_price, cl_spot)
 
                     storage.upsert_window(
                         window_ts=window_ts,
@@ -684,23 +886,60 @@ async def monitor_loop(
                         wt = asyncio.create_task(_bg_warmup_window(live_exec, st.up_token, st.down_token))
                         bg_tasks.add(wt)
                         wt.add_done_callback(bg_tasks.discard)
-                    elif 90.0 <= elapsed <= 295.0 and (now - last_ka_dispatch_ts) >= 15.0:
+                    elif 135.0 <= elapsed <= 295.0 and (now - last_ka_dispatch_ts) >= 10.0:
                         last_ka_dispatch_ts = now
-                        asyncio.get_running_loop().run_in_executor(None, live_exec.keepalive_if_needed, 14.0)
+                        asyncio.get_running_loop().run_in_executor(None, live_exec.keepalive_if_needed, 10.0)
 
                 fv = None
                 if cl_spot is not None and st.strike_price is not None:
-                    fv = estimate_fair_value(
-                        strike_price=st.strike_price,
-                        chainlink_price=cl_spot,
-                        remaining_sec=remaining,
-                        vol_1s=vol_1s,
-                        orderflow_score=flow_score,
-                        cex_lead_price=cex_lead,
-                        dynamic_gap_bps=dyn_gap_bps,
-                        student_t_df=cfg.student_t_df,
-                        cvd_imbalance=cvd_imb,
-                    )
+                    if cfg.use_twap_projection:
+                        fv = estimate_twap_fair_value(
+                            strike_price=st.strike_price,
+                            chainlink_price=cl_spot,
+                            remaining_sec=remaining,
+                            vol_1s=vol_1s,
+                            orderflow_score=flow_score,
+                            cex_lead_price=cex_lead,
+                            dynamic_gap_bps=dyn_gap_bps,
+                            cvd_imbalance=cvd_imb,
+                            realized_240=st.realized_twap240,
+                            twap_gaussian_weight=cfg.twap_gaussian_weight,
+                            twap_student_t_df=cfg.twap_student_t_df,
+                        )
+                    else:
+                        fv = estimate_fair_value(
+                            strike_price=st.strike_price,
+                            chainlink_price=cl_spot,
+                            remaining_sec=remaining,
+                            vol_1s=vol_1s,
+                            orderflow_score=flow_score,
+                            cex_lead_price=cex_lead,
+                            dynamic_gap_bps=dyn_gap_bps,
+                            student_t_df=cfg.student_t_df,
+                            cvd_imbalance=cvd_imb,
+                        )
+                if fv is not None and cfg.e4_dual_consensus and cfg.use_twap_projection:
+                    basis_60s = tracker.mean_basis_60s(now)
+                    if basis_60s is not None and st.binance_price is not None and (now - st.binance_ts) <= 5.0:
+                        bn_adj = float(st.binance_price) - basis_60s
+                        if bn_adj > 0.0:
+                            fv_bn = estimate_twap_fair_value(
+                                strike_price=st.strike_price,
+                                chainlink_price=bn_adj,
+                                remaining_sec=remaining,
+                                vol_1s=vol_1s,
+                                orderflow_score=flow_score,
+                                cex_lead_price=cex_lead,
+                                dynamic_gap_bps=dyn_gap_bps,
+                                cvd_imbalance=cvd_imb,
+                                realized_240=st.realized_twap240,
+                                twap_gaussian_weight=cfg.twap_gaussian_weight,
+                                twap_student_t_df=cfg.twap_student_t_df,
+                            )
+                            if fv_bn is not None:
+                                fv.bn_raw_z = fv_bn.raw_z_score
+                                fv.bn_p_true_up = fv_bn.p_true_up
+                                fv.bn_p_true_down = fv_bn.p_true_down
 
                 if is_1hz_tick:
                     if hub.chainlink._precise_clock_synced_ts > last_seen_clock_sync_ts:
@@ -715,7 +954,12 @@ async def monitor_loop(
                         ):
                             last_clock_warn_ts = time.time()
                             _emit(f"[CLOCK WARN] raw_offset_ms={hub.chainlink.raw_clock_offset_ms:+.1f}ms > 250ms")
-                            if tg.enabled and tg.get_recipient_ids():
+                            if (
+                                hub.chainlink._consecutive_clock_warn_count >= 2
+                                and tg.enabled
+                                and tg.get_recipient_ids()
+                                and (shared_risk is None or shared_risk.claim_alert("clock:skew", cooldown_sec=3600.0))
+                            ):
                                 tg.notify_alert(
                                     "系統時鐘偏差警告",
                                     f"本機時鐘偏差 {hub.chainlink.raw_clock_offset_ms:+.1f}ms (>250ms)",
@@ -739,15 +983,16 @@ async def monitor_loop(
                             ),
                             ("binance", now_wall - st.binance_ts if st.binance_ts > 0 else 999.0),
                         )
-                        for f_name, f_sil in feed_silences:
-                            if f_sil > 10.0 and (now_wall - last_feed_warn_ts.get(f_name, 0.0)) >= 900.0:
-                                last_feed_warn_ts[f_name] = now_wall
-                                _emit(f"[FEED WARN] {f_name} silent={f_sil:.1f}s (>10s)")
-                                if tg.enabled and tg.get_recipient_ids():
-                                    tg.notify_alert(
-                                        "資料源斷線超過 10 秒",
-                                        f"{f_name} 已靜默 {f_sil:.1f} 秒 (>10s)，請檢查網路或 VPN。",
-                                    )
+                        _handle_feed_health_alerts(
+                            feed_silences=feed_silences,
+                            now_wall=now_wall,
+                            last_feed_log_ts=last_feed_warn_ts,
+                            last_feed_tg_ts=last_feed_tg_ts,
+                            local_active_alerts=local_active_feed_alerts,
+                            emit_fn=_emit,
+                            tg=tg,
+                            shared_risk=shared_risk,
+                        )
 
                     storage.record_snapshot(
                         ts=now,
@@ -772,8 +1017,71 @@ async def monitor_loop(
                     )
 
                 if fv is not None:
+                    maker_filled_closed = False
+                    if (
+                        live_exec is not None
+                        and maker_tp_order_id
+                        and strategy.active_position is not None
+                        and strategy.active_position.window_ts == window_ts
+                        and active_db_trade_id is not None
+                        and (now - last_maker_check_ts) >= 2.0
+                        and not maker_tp_inflight
+                    ):
+                        last_maker_check_ts = now
+                        maker_tp_inflight = True
+                        try:
+                            m_res = await asyncio.get_running_loop().run_in_executor(
+                                None,
+                                live_exec.check_maker_order_status,
+                                maker_tp_order_id,
+                                0.99,
+                                maker_tp_token,
+                                strategy.active_position.shares,
+                            )
+                        finally:
+                            maker_tp_inflight = False
+                        if m_res.filled and m_res.filled_shares >= strategy.active_position.shares * 0.90:
+                            pos_now = strategy.active_position
+                            fill_px = m_res.avg_price if m_res.avg_price > 0 else 0.99
+                            real_payout = effective_exit_proceeds(
+                                fill_px, is_maker=True, fee_rate=cfg.crypto_taker_fee_rate
+                            )
+                            prior_partial = pos_now.realized_partial_pnl_usdc
+                            close_msg = strategy._close_active(now, real_payout, "MAKER_TAKE_PROFIT")
+                            last = strategy.closed_trades[-1]
+                            final_leg_pnl = last.net_pnl_usdc - prior_partial
+                            _emit(
+                                f"🟢 [MAKER 停利成交] order={maker_tp_order_id[:19]} | "
+                                f"filled={m_res.filled_shares:.2f} @ ${fill_px:.3f} (0% fee) | "
+                                f"實得淨損益={last.net_pnl_usdc:+.2f} pUSD"
+                            )
+                            _emit(f"*** {close_msg} ***")
+                            last_bal_sync_ts = 0.0
+                            _commit_live_exit_accounting(
+                                last=last,
+                                final_leg_pnl=final_leg_pnl,
+                                now_ts=now,
+                                active_db_trade_id=active_db_trade_id,
+                                live_exec=live_exec,
+                                shared_risk=shared_risk,
+                                strategy=strategy,
+                                storage=storage,
+                                tg=tg,
+                                live_mode=live_mode,
+                                emit_fn=_emit,
+                                tg_commands_only=tg_commands_only,
+                            )
+                            active_db_trade_id = None
+                            maker_tp_order_id = ""
+                            maker_tp_token = ""
+                            maker_filled_closed = True
+
                     prev_pos = strategy.active_position
-                    action = strategy.evaluate_tick(now, window_ts, elapsed, fv, st.book)
+                    action = (
+                        None
+                        if maker_filled_closed
+                        else strategy.evaluate_tick(now, window_ts, elapsed, fv, st.book, strike_source=st.strike_source)
+                    )
                     if action:
                         if (
                             prev_pos is None
@@ -796,6 +1104,7 @@ async def monitor_loop(
                             live_order_id = ""
                             if live_exec is not None:
                                 abort_live_entry = False
+                                keep_window_blocked = False
                                 if not startup_reconciled:
                                     abort_live_entry = True
                                 elif not cl.is_alive(max_silence_sec=4.5):
@@ -806,7 +1115,7 @@ async def monitor_loop(
                                         f"⚠️ [LIVE 盤口過舊攔截] book_age={book_age:.2f}s book_lag={book_lag:.2f}s (門檻 1.5s/1.0s)，跳過進場。"
                                     )
                                     abort_live_entry = True
-                                elif (now - last_live_attempt_ts) < 5.0:
+                                elif (now - last_live_attempt_ts) < last_live_attempt_cooldown:
                                     abort_live_entry = True
                                 elif shared_risk is not None:
                                     broken, dpnl, dcap = shared_risk.is_broken()
@@ -840,7 +1149,7 @@ async def monitor_loop(
                                                 avail = 0.0
                                                 if bet_pct > 0.0:
                                                     fast_bal = (
-                                                        shared_risk.get_fast_balance(max_age_sec=25.0, min_safe_usdc=10.0)
+                                                        shared_risk.get_fast_balance(max_age_sec=30.0, min_safe_usdc=10.0)
                                                         if shared_risk is not None
                                                         else None
                                                     )
@@ -862,25 +1171,50 @@ async def monitor_loop(
                                                             error=f"可用 pUSD 餘額不足 5 股 (${avail:.2f})",
                                                         )
                                                     p.shares = adj_sh
+                                                slot_acquired = False
+                                                if shared_risk is not None:
+                                                    slot_acquired = shared_risk.try_acquire_window_slot(
+                                                        window_ts, "BTC", max_coins=1
+                                                    )
+                                                    if not slot_acquired:
+                                                        return LiveFillResult(
+                                                            False,
+                                                            0.0,
+                                                            p.entry_price,
+                                                            error="WINDOW_SLOT_LIMIT_1_COIN",
+                                                        )
                                                 res = live_exec.execute_entry(
                                                     token_id=target_token,
                                                     ask_price=p.entry_price,
                                                     shares=p.shares,
-                                                    max_price=cfg.max_entry_price,
+                                                    max_price=round(min(0.84, cfg.max_entry_price + 0.02), 2),
                                                     p_true=p.p_true_at_entry,
                                                     fee_rate=cfg.crypto_taker_fee_rate,
                                                     available_pusd=avail,
                                                 )
-                                                if res.filled and res.filled_shares > 0.0 and shared_risk is not None:
-                                                    fill_px = res.avg_price if res.avg_price > 0 else p.entry_price
-                                                    shared_risk.record_spend(res.filled_shares * fill_px)
+                                                if res.filled and res.filled_shares > 0.0:
+                                                    if shared_risk is not None:
+                                                        fill_px = res.avg_price if res.avg_price > 0 else p.entry_price
+                                                        shared_risk.record_spend(res.filled_shares * fill_px)
+                                                elif slot_acquired and shared_risk is not None:
+                                                    shared_risk.release_window_slot(window_ts, "BTC")
                                                 return res
 
                                         fill = await asyncio.get_running_loop().run_in_executor(None, _locked_live_entry)
                                         if not fill.filled or fill.filled_shares <= 0.0:
-                                            _emit(f"⚠️ [LIVE FAK 未成交] {fill.error or '流動性不足'}，已自動取消不追價。")
-                                            abort_live_entry = True
+                                            if fill.error == "WINDOW_SLOT_LIMIT_1_COIN":
+                                                _emit(
+                                                    f"🔒 [跨幣單槽保護] 窗口 {window_ts} 已有他幣成交持倉，本窗口跳過不重複進場。"
+                                                )
+                                                keep_window_blocked = True
+                                                abort_live_entry = True
+                                            else:
+                                                err_low = str(fill.error or "").lower()
+                                                last_live_attempt_cooldown = 2.0 if "no orders found to match" in err_low else 5.0
+                                                _emit(f"⚠️ [LIVE FAK 未成交] {fill.error or '流動性不足'}，已自動取消不追價。")
+                                                abort_live_entry = True
                                         else:
+                                            last_live_attempt_cooldown = 5.0
                                             live_order_id = fill.order_id
                                             p.shares = fill.filled_shares
                                             if fill.avg_price > 0:
@@ -911,7 +1245,8 @@ async def monitor_loop(
                                                     )
                                 if abort_live_entry:
                                     strategy.active_position = None
-                                    strategy.traded_windows.discard(window_ts)
+                                    if not keep_window_blocked:
+                                        strategy.traded_windows.discard(window_ts)
                                     consecutive_loop_errors = 0
                                     await asyncio.sleep(loop_sleep)
                                     continue
@@ -928,7 +1263,7 @@ async def monitor_loop(
                                 p_true_at_entry=p.p_true_at_entry,
                                 z_at_entry=p.z_at_entry,
                             )
-                            if tg.enabled:
+                            if tg.enabled and not tg_commands_only:
                                 tg.notify_entry(
                                     trade_id=active_db_trade_id,
                                     side=p.side,
@@ -944,118 +1279,182 @@ async def monitor_loop(
                                 )
                         elif prev_pos is not None and strategy.active_position is None and active_db_trade_id is not None and strategy.closed_trades:
                             last = strategy.closed_trades[-1]
+                            final_leg_pnl_commit = last.net_pnl_usdc - prev_pos.realized_partial_pnl_usdc
                             if live_exec is not None:
                                 target_token = st.up_token if last.side == "UP" else st.down_token
                                 bid_px = st.book.up_bid if last.side == "UP" else st.book.down_bid
-                                slip = 0.05 if "STOP_LOSS" in last.exit_reason else 0.03
-                                exit_fill = (
-                                    await asyncio.get_running_loop().run_in_executor(
-                                        None,
-                                        lambda: live_exec.execute_exit(
-                                            token_id=target_token,
-                                            bid_price=bid_px,
-                                            shares=last.shares,
-                                            slippage_cents=slip,
-                                        ),
-                                    )
-                                    if (target_token and bid_px)
-                                    else None
-                                )
                                 prior_partial = prev_pos.realized_partial_pnl_usdc
                                 rem_est_pnl = last.net_pnl_usdc - prior_partial
-                                if exit_fill is None or not exit_fill.filled or exit_fill.filled_shares <= 0.0:
-                                    err_msg = exit_fill.error if exit_fill else "無可用買盤"
-                                    _emit(f"⚠️ [LIVE 平倉未成交] {err_msg}，保留真實持倉繼續盯盤！")
-                                    strategy.closed_trades.pop()
-                                    strategy.bankroll -= rem_est_pnl
-                                    strategy.active_position = prev_pos
-                                    consecutive_loop_errors = 0
-                                    await asyncio.sleep(loop_sleep)
-                                    continue
-                                if exit_fill.filled_shares < prev_pos.shares * 0.90:
-                                    part_px = exit_fill.avg_price if exit_fill.avg_price > 0 else bid_px
-                                    part_payout = effective_exit_proceeds(
-                                        part_px,
-                                        is_maker=False,
-                                        fee_rate=cfg.crypto_taker_fee_rate,
+                                maker_already_filled: Optional[LiveFillResult] = None
+                                if maker_tp_order_id:
+                                    _oid_pre = maker_tp_order_id
+                                    _tok_pre = maker_tp_token or target_token or ""
+                                    await asyncio.get_running_loop().run_in_executor(
+                                        None, live_exec.cancel_order_safe, _oid_pre
                                     )
-                                    part_pnl = exit_fill.filled_shares * (part_payout - prev_pos.total_cost_per_share)
-                                    _emit(
-                                        f"🔴 [LIVE 部分平倉] filled={exit_fill.filled_shares:.2f}/{prev_pos.shares:.2f} "
-                                        f"@ ${part_px:.3f} (已實現={part_pnl:+.2f} pUSD)，剩餘部位繼續盯盤！"
+                                    m_pre = await asyncio.get_running_loop().run_in_executor(
+                                        None,
+                                        live_exec.check_maker_order_status,
+                                        _oid_pre,
+                                        0.99,
+                                        _tok_pre,
+                                        prev_pos.shares,
                                     )
-                                    strategy.closed_trades.pop()
-                                    strategy.bankroll = strategy.bankroll - rem_est_pnl + part_pnl
-                                    prev_pos.realized_partial_pnl_usdc += part_pnl
-                                    prev_pos.shares = round(prev_pos.shares - exit_fill.filled_shares, 2)
-                                    live_exec.record_realized_pnl(part_pnl)
-                                    if shared_risk is not None:
-                                        r_state = shared_risk.record_pnl(part_pnl, current_equity=strategy.bankroll)
-                                        live_exec.daily_pnl_usdc = float(r_state["daily_realized_pnl_usdc"])
-                                        live_exec.max_daily_loss_usdc = float(r_state["max_daily_loss_usdc"])
-                                        live_exec.circuit_broken = bool(r_state["circuit_broken"])
-                                    strategy.active_position = prev_pos
-                                    consecutive_loop_errors = 0
-                                    await asyncio.sleep(loop_sleep)
-                                    continue
-                                final_leg_pnl = rem_est_pnl
-                                if exit_fill.avg_price > 0:
+                                    maker_tp_order_id = ""
+                                    maker_tp_token = ""
+                                    if m_pre.filled and m_pre.filled_shares >= prev_pos.shares * 0.90:
+                                        maker_already_filled = m_pre
+
+                                if maker_already_filled is not None:
+                                    fill_px = maker_already_filled.avg_price if maker_already_filled.avg_price > 0 else 0.99
                                     real_payout = effective_exit_proceeds(
-                                        exit_fill.avg_price,
-                                        is_maker=False,
-                                        fee_rate=cfg.crypto_taker_fee_rate,
+                                        fill_px, is_maker=True, fee_rate=cfg.crypto_taker_fee_rate
                                     )
                                     old_pnl = last.net_pnl_usdc
+                                    last.exit_reason = "MAKER_TAKE_PROFIT"
                                     last.exit_payout_per_share = real_payout
-                                    final_leg_pnl = last.shares * (real_payout - last.total_cost_per_share)
-                                    last.net_pnl_usdc = prior_partial + final_leg_pnl
+                                    final_leg_pnl_commit = last.shares * (real_payout - last.total_cost_per_share)
+                                    last.net_pnl_usdc = prior_partial + final_leg_pnl_commit
                                     last.won = last.net_pnl_usdc > 0
                                     strategy.bankroll += (last.net_pnl_usdc - old_pnl)
-                                _emit(
-                                    f"🔴 [LIVE 實盤平倉] {last.exit_reason} | filled={exit_fill.filled_shares:.2f} "
-                                    f"@ ${exit_fill.avg_price:.3f} | 實得淨損益={last.net_pnl_usdc:+.2f} pUSD | "
-                                    f"耗時 {exit_fill.latency_ms:.0f}ms"
-                                )
-                                live_exec.record_realized_pnl(final_leg_pnl)
-                                if shared_risk is not None:
-                                    r_state = shared_risk.record_pnl(final_leg_pnl, current_equity=strategy.bankroll)
-                                    live_exec.daily_pnl_usdc = float(r_state["daily_realized_pnl_usdc"])
-                                    live_exec.max_daily_loss_usdc = float(r_state["max_daily_loss_usdc"])
-                                    live_exec.circuit_broken = bool(r_state["circuit_broken"])
-                                last_bal_sync_ts = 0.0
-                                if live_exec.circuit_broken:
                                     _emit(
-                                        f"🛑 [風控熔斷] 今日實盤累計虧損已達上限 "
-                                        f"(-${live_exec.max_daily_loss_usdc:.1f})，已自動停止新開倉！"
+                                        f"🟢 [MAKER 停利已先成交] filled={maker_already_filled.filled_shares:.2f} "
+                                        f"@ ${fill_px:.3f} (0% fee) | 實得淨損益={last.net_pnl_usdc:+.2f} pUSD"
                                     )
+                                    last_bal_sync_ts = 0.0
+                                else:
+                                    is_sl = "STOP_LOSS" in last.exit_reason
+                                    slip = 0.05 if is_sl else 0.00
+                                    min_lim = 0.01 if is_sl else cfg.take_profit_bid
+                                    exit_fill = (
+                                        await asyncio.get_running_loop().run_in_executor(
+                                            None,
+                                            lambda: live_exec.execute_exit(
+                                                token_id=target_token,
+                                                bid_price=bid_px,
+                                                shares=last.shares,
+                                                slippage_cents=slip,
+                                                min_limit_px=min_lim,
+                                            ),
+                                        )
+                                        if (target_token and bid_px)
+                                        else None
+                                    )
+                                    if exit_fill is None or not exit_fill.filled or exit_fill.filled_shares <= 0.0:
+                                        err_msg = exit_fill.error if exit_fill else "無可用買盤"
+                                        _emit(f"⚠️ [LIVE 平倉未成交] {err_msg}，保留真實持倉繼續盯盤！")
+                                        strategy.closed_trades.pop()
+                                        strategy.bankroll -= rem_est_pnl
+                                        strategy.active_position = prev_pos
+                                        consecutive_loop_errors = 0
+                                        await asyncio.sleep(loop_sleep)
+                                        continue
+                                    if exit_fill.filled_shares < prev_pos.shares * 0.90:
+                                        part_px = exit_fill.avg_price if exit_fill.avg_price > 0 else bid_px
+                                        part_payout = effective_exit_proceeds(
+                                            part_px,
+                                            is_maker=False,
+                                            fee_rate=cfg.crypto_taker_fee_rate,
+                                        )
+                                        part_pnl = exit_fill.filled_shares * (part_payout - prev_pos.total_cost_per_share)
+                                        _emit(
+                                            f"🔴 [LIVE 部分平倉] filled={exit_fill.filled_shares:.2f}/{prev_pos.shares:.2f} "
+                                            f"@ ${part_px:.3f} (已實現={part_pnl:+.2f} pUSD)，剩餘部位繼續盯盤！"
+                                        )
+                                        strategy.closed_trades.pop()
+                                        strategy.bankroll = strategy.bankroll - rem_est_pnl + part_pnl
+                                        prev_pos.realized_partial_pnl_usdc += part_pnl
+                                        prev_pos.shares = round(prev_pos.shares - exit_fill.filled_shares, 2)
+                                        live_exec.record_realized_pnl(part_pnl)
+                                        if shared_risk is not None:
+                                            r_state = shared_risk.record_pnl(part_pnl, current_equity=strategy.bankroll)
+                                            live_exec.daily_pnl_usdc = float(r_state["daily_realized_pnl_usdc"])
+                                            live_exec.max_daily_loss_usdc = float(r_state["max_daily_loss_usdc"])
+                                            live_exec.circuit_broken = bool(r_state["circuit_broken"])
+                                        strategy.active_position = prev_pos
+                                        consecutive_loop_errors = 0
+                                        await asyncio.sleep(loop_sleep)
+                                        continue
+                                    final_leg_pnl_commit = rem_est_pnl
+                                    if exit_fill.avg_price > 0:
+                                        real_payout = effective_exit_proceeds(
+                                            exit_fill.avg_price,
+                                            is_maker=False,
+                                            fee_rate=cfg.crypto_taker_fee_rate,
+                                        )
+                                        old_pnl = last.net_pnl_usdc
+                                        last.exit_payout_per_share = real_payout
+                                        final_leg_pnl_commit = last.shares * (real_payout - last.total_cost_per_share)
+                                        last.net_pnl_usdc = prior_partial + final_leg_pnl_commit
+                                        last.won = last.net_pnl_usdc > 0
+                                        strategy.bankroll += (last.net_pnl_usdc - old_pnl)
+                                    _emit(
+                                        f"🔴 [LIVE 實盤平倉] {last.exit_reason} | filled={exit_fill.filled_shares:.2f} "
+                                        f"@ ${exit_fill.avg_price:.3f} | 實得淨損益={last.net_pnl_usdc:+.2f} pUSD | "
+                                        f"耗時 {exit_fill.latency_ms:.0f}ms"
+                                    )
+                                    last_bal_sync_ts = 0.0
 
                             _emit(f"*** {action} ***")
-                            storage.close_paper_trade(
-                                active_db_trade_id,
-                                now,
-                                last.exit_reason,
-                                last.exit_payout_per_share,
-                                last.net_pnl_usdc,
-                                last.won,
+                            _commit_live_exit_accounting(
+                                last=last,
+                                final_leg_pnl=final_leg_pnl_commit,
+                                now_ts=now,
+                                active_db_trade_id=active_db_trade_id,
+                                live_exec=live_exec,
+                                shared_risk=shared_risk,
+                                strategy=strategy,
+                                storage=storage,
+                                tg=tg,
+                                live_mode=live_mode,
+                                emit_fn=_emit,
+                                tg_commands_only=tg_commands_only,
                             )
-                            if tg.enabled:
-                                tg.notify_exit(
-                                    trade_id=active_db_trade_id,
-                                    side=last.side,
-                                    window_ts=last.window_ts,
-                                    exit_reason=last.exit_reason,
-                                    net_pnl_usdc=last.net_pnl_usdc,
-                                    won=last.won,
-                                    exit_payout_per_share=last.exit_payout_per_share,
-                                    entry_price=last.entry_price,
-                                    live_mode=live_mode,
-                                )
-                                if live_exec is not None and live_exec.circuit_broken:
-                                    tg.notify_alert(
-                                        "實盤風控熔斷觸發",
-                                        f"今日實盤累計虧損已達上限 (-${live_exec.max_daily_loss_usdc:.1f} pUSD)，已自動停止開新倉！",
-                                    )
                             active_db_trade_id = None
+                            maker_tp_order_id = ""
+                            maker_tp_token = ""
+
+                    if (
+                        live_exec is not None
+                        and not maker_tp_order_id
+                        and maker_tp_placed_window != window_ts
+                        and not maker_tp_inflight
+                        and strategy.active_position is not None
+                        and strategy.active_position.window_ts == window_ts
+                        and active_db_trade_id is not None
+                        and elapsed < 292.0
+                    ):
+                        pos_open = strategy.active_position
+                        cur_bid = st.book.up_bid if pos_open.side == "UP" else st.book.down_bid
+                        cur_p = fv.p_true_up if pos_open.side == "UP" else fv.p_true_down
+                        tok_open = st.up_token if pos_open.side == "UP" else st.down_token
+                        if (
+                            tok_open
+                            and cur_bid is not None
+                            and 0.94 <= cur_bid < 0.99
+                            and cur_p >= 0.95
+                            and live_exec._cond_balance_cache.get(tok_open, 0.0) >= 5.0
+                        ):
+                            maker_tp_placed_window = window_ts
+                            maker_tp_inflight = True
+                            try:
+                                m_post = await asyncio.get_running_loop().run_in_executor(
+                                    None,
+                                    live_exec.post_maker_tp_sell,
+                                    tok_open,
+                                    pos_open.shares,
+                                    0.99,
+                                )
+                            finally:
+                                maker_tp_inflight = False
+                            if m_post.order_id and not m_post.error:
+                                maker_tp_order_id = m_post.order_id
+                                maker_tp_token = tok_open
+                                last_maker_check_ts = now
+                                _emit(
+                                    f"📌 [MAKER TP 掛單] order={maker_tp_order_id[:19]} @ $0.990 "
+                                    f"({pos_open.shares:.2f} sh, 0% fee)"
+                                )
 
                     if is_1hz_tick:
                         up_ask_str = f"{st.book.up_ask:.2f}" if st.book.up_ask else " -- "
@@ -1102,7 +1501,10 @@ async def monitor_loop(
                     print("\r" + _fit_console_line(line), end="", flush=True)
 
                 consecutive_loop_errors = 0
-                await asyncio.sleep(loop_sleep)
+                await hub.wait_next_tick(
+                    loop_sleep,
+                    min_interval_sec=0.025 if hot_zone else 0.95,
+                )
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
@@ -1141,6 +1543,7 @@ if __name__ == "__main__":
     parser.add_argument("--bet-pct", type=float, default=0.0, help="按即時權益等比下注比例 (例: 0.10 = 10%，優先於 --bet)")
     parser.add_argument("--max-daily-loss-pct", type=float, default=0.0, help="三幣共用單日最大虧損比例熔斷 (例: 0.30 = 30%)")
     parser.add_argument("--log-file", default="", help="結構化日誌檔路徑 (50MB 輪替保留 5 份；非終端機停止 \\r 狀態輸出)")
+    parser.add_argument("--tg-commands-only", action="store_true", help="保留 TG 指令輪詢與健康告警，但靜音本幣別進出場成交推播")
     args = parser.parse_args()
     asyncio.run(
         monitor_loop(
@@ -1152,5 +1555,6 @@ if __name__ == "__main__":
             bet_pct=args.bet_pct,
             max_daily_loss_pct=args.max_daily_loss_pct,
             log_file=args.log_file,
+            tg_commands_only=args.tg_commands_only,
         )
     )

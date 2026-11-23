@@ -983,6 +983,8 @@ class TelegramBotService:
             if funder:
                 bal = _fetch_onchain_pusd_balance(funder)
                 source = f"Polygon 鏈上錢包 (<code>{funder[:6]}...{funder[-4:]}</code>)"
+                if bal is not None:
+                    unit = "pUSD"
 
         ctrl = self.control.load()
         cur_bet = ctrl.get("bet_usdc") or self.bet_usdc

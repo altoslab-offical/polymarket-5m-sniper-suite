@@ -93,16 +93,34 @@ class MarketDataStorage:
                 up_token_id = COALESCE(excluded.up_token_id, windows.up_token_id),
                 down_token_id = COALESCE(excluded.down_token_id, windows.down_token_id),
                 strike_price = CASE
-                    WHEN excluded.strike_source IN ('GAMMA_OFFICIAL', 'BOOK_CALIBRATED') AND excluded.strike_price IS NOT NULL
+                    WHEN excluded.strike_source = 'GAMMA_OFFICIAL' AND excluded.strike_price IS NOT NULL
                     THEN excluded.strike_price
-                    WHEN windows.strike_source IN ('UNSET', 'WAITING_GAMMA_OR_NEXT_WINDOW') AND excluded.strike_price IS NOT NULL
+                    WHEN excluded.strike_source = 'OFFICIAL_TWAP60'
+                         AND COALESCE(windows.strike_source, '') != 'GAMMA_OFFICIAL'
+                         AND excluded.strike_price IS NOT NULL
+                    THEN excluded.strike_price
+                    WHEN excluded.strike_source = 'BOOK_CALIBRATED'
+                         AND COALESCE(windows.strike_source, '') NOT IN ('GAMMA_OFFICIAL', 'OFFICIAL_TWAP60')
+                         AND excluded.strike_price IS NOT NULL
+                    THEN excluded.strike_price
+                    WHEN (windows.strike_price IS NULL OR windows.strike_source IN ('UNSET', 'WAITING_GAMMA_OR_NEXT_WINDOW'))
+                         AND excluded.strike_price IS NOT NULL
                     THEN excluded.strike_price
                     ELSE COALESCE(windows.strike_price, excluded.strike_price)
                 END,
                 strike_source = CASE
-                    WHEN excluded.strike_source IN ('GAMMA_OFFICIAL', 'BOOK_CALIBRATED') AND excluded.strike_price IS NOT NULL
+                    WHEN excluded.strike_source = 'GAMMA_OFFICIAL' AND excluded.strike_price IS NOT NULL
                     THEN excluded.strike_source
-                    WHEN windows.strike_source IN ('UNSET', 'WAITING_GAMMA_OR_NEXT_WINDOW') AND excluded.strike_price IS NOT NULL
+                    WHEN excluded.strike_source = 'OFFICIAL_TWAP60'
+                         AND COALESCE(windows.strike_source, '') != 'GAMMA_OFFICIAL'
+                         AND excluded.strike_price IS NOT NULL
+                    THEN excluded.strike_source
+                    WHEN excluded.strike_source = 'BOOK_CALIBRATED'
+                         AND COALESCE(windows.strike_source, '') NOT IN ('GAMMA_OFFICIAL', 'OFFICIAL_TWAP60')
+                         AND excluded.strike_price IS NOT NULL
+                    THEN excluded.strike_source
+                    WHEN (windows.strike_price IS NULL OR windows.strike_source IN ('UNSET', 'WAITING_GAMMA_OR_NEXT_WINDOW'))
+                         AND excluded.strike_price IS NOT NULL
                     THEN excluded.strike_source
                     ELSE COALESCE(windows.strike_source, excluded.strike_source)
                 END

@@ -18,8 +18,9 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import time
-from typing import Any, Deque, List, Optional, Tuple
+from typing import Any, Callable, Deque, List, Optional, Tuple
 import urllib.parse
 
 import requests
@@ -31,6 +32,7 @@ CHAINLINK_DATAENGINE_HOST = "ws.dataengine.chain.link"
 POLYBOLT_WS_URL = "wss://ws-live-v2.polymarket.com/ws"
 POLY_RTDS_WS_URL = "wss://ws-live-data.polymarket.com"
 STREAMING_ORACLE_SOURCES = ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK", "POLY_RTDS_CHAINLINK")
+PRIMARY_ORACLE_SOURCES = ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK")
 BINANCE_TIME_URLS = ("https://api.binance.com/api/v3/time", "https://data-api.binance.vision/api/v3/time")
 
 POLYGON_CHAINLINK_BTC_USD = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
@@ -143,10 +145,29 @@ def build_data_streams_hmac_headers(
     }
 
 
+def _parse_ts_sec(raw_ts: Any) -> Optional[float]:
+    """Parse epoch timestamp in milliseconds or seconds into UTC seconds."""
+    if raw_ts is None:
+        return None
+    try:
+        val = float(raw_ts)
+    except (TypeError, ValueError):
+        return None
+    if val > 1e11:
+        return val / 1000.0
+    if val > 1e9:
+        return val
+    return None
+
+
 @dataclass
 class ChainlinkOracleState:
     price: Optional[float] = None
     twap_60s: Optional[float] = None
+    official_twap_60s: Optional[float] = None
+    official_twap_ts: float = 0.0
+    official_twap_recv_ts: float = 0.0
+    official_twap_source: str = ""
     oracle_ts: float = 0.0          # On-chain `updatedAt` or stream observation timestamp
     local_recv_ts: float = 0.0      # Wall-clock time of last verified live response
     source: str = "UNINITIALIZED"
@@ -187,15 +208,23 @@ class ChainlinkOracleFeed:
     Multi-tier Chainlink BTC/USD live oracle manager with Round-Robin RPC anti-ban protection.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        on_tick_callback: Optional[Callable[[], None]] = None,
+        on_price_callback: Optional[Callable[[float, float], None]] = None,
+    ) -> None:
         self.state = ChainlinkOracleState()
+        self.on_tick_callback: Optional[Callable[[], None]] = on_tick_callback
+        self.on_price_callback: Optional[Callable[[float, float], None]] = on_price_callback
         self._twap_samples: Deque[Tuple[float, float]] = deque(maxlen=600)
         self._utc_history: Deque[Tuple[float, float]] = deque(maxlen=360)  # (oracle_utc_ts, price)
         self._utc_twap_history: Deque[Tuple[float, float]] = deque(maxlen=360)
+        self._official_twap_history: Deque[Tuple[float, float]] = deque(maxlen=900)
         self.clock_offset_sec: float = 0.0
         self.raw_clock_offset_ms: float = 0.0
         self._precise_clock_synced_ts: float = 0.0
         self._clock_samples: Deque[float] = deque(maxlen=15)
+        self._consecutive_clock_warn_count: int = 0
         self.rtds_reconnects: int = 0
         self.polybolt_reconnects: int = 0
         self._stop_event = asyncio.Event()
@@ -212,13 +241,22 @@ class ChainlinkOracleFeed:
         if abs(offset_sec) > 86400.0:
             return self.raw_clock_offset_ms
         self.raw_clock_offset_ms = round(offset_sec * 1000.0, 1)
+        if abs(self.raw_clock_offset_ms) > 250.0:
+            self._consecutive_clock_warn_count += 1
+        else:
+            self._consecutive_clock_warn_count = 0
         self.clock_offset_sec = offset_sec if abs(offset_sec) >= 0.05 else 0.0
         self.state.clock_offset_sec = self.clock_offset_sec
         self._precise_clock_synced_ts = time.time()
         return self.raw_clock_offset_ms
 
-    def sync_clock_precise(self, session: Optional[requests.Session] = None, samples: int = 3) -> Optional[float]:
-        """Measure UTC offset against Binance `/api/v3/time` (ms resolution) subtracting RTT/2."""
+    def sync_clock_precise(
+        self,
+        session: Optional[requests.Session] = None,
+        samples: int = 3,
+        max_rtt_sec: float = 0.6,
+    ) -> Optional[float]:
+        """Measure UTC offset against Binance `/api/v3/time` (ms resolution) rejecting congested RTT probes."""
         http = session or self._http
         offs: List[float] = []
         n_probes = max(1, int(samples))
@@ -231,7 +269,7 @@ class ChainlinkOracleFeed:
                 if resp.status_code != 200:
                     continue
                 rtt = max(0.0, t1 - t0)
-                if rtt > 1.5:
+                if rtt > max_rtt_sec:
                     continue
                 srv_ms = float(resp.json()["serverTime"])
                 offs.append((srv_ms / 1000.0) - (t0 + 0.5 * rtt))
@@ -241,6 +279,26 @@ class ChainlinkOracleFeed:
             return None
         offs.sort()
         return self.update_clock_offset_precise(offs[len(offs) // 2])
+
+    def _is_primary_streaming_healthy(self, now_ts: float, max_age_sec: float = 3.0) -> bool:
+        """Return True when primary high-frequency Chainlink stream ticked recently."""
+        return (
+            self.state.source in PRIMARY_ORACLE_SOURCES
+            and self.state.local_recv_ts > 0.0
+            and (now_ts - self.state.local_recv_ts) < max_age_sec
+        )
+
+    def _rtds_zombie_timeout_sec(self, now_ts: float) -> float:
+        """Relax standby RTDS silence threshold to 15s while primary stream is healthy."""
+        return 15.0 if self._is_primary_streaming_healthy(now_ts) else 3.5
+
+    @staticmethod
+    def _rtds_reconnect_delay_sec(consec_failures: int, primary_healthy: bool) -> float:
+        """Compute bounded exponential backoff for RTDS reconnects."""
+        step = max(0, int(consec_failures) - 1)
+        if primary_healthy:
+            return min(15.0, round(2.0 * (2 ** min(step, 3)), 2))
+        return min(5.0, round(1.0 * (1.5 ** min(step, 4)), 2))
 
     def update_clock_offset(self, server_utc_ts: float, local_ts: Optional[float] = None) -> None:
         """
@@ -286,6 +344,37 @@ class ChainlinkOracleFeed:
                 best_p = p
         return best_p
 
+    def on_official_twap_tick(
+        self,
+        price: float,
+        oracle_ts: float,
+        source: str = "OFFICIAL_TWAP60",
+    ) -> None:
+        """Record an official Chainlink 60s TWAP tick with its authoritative observation timestamp."""
+        if price <= 0.0 or oracle_ts <= 0.0:
+            return
+        ots = float(oracle_ts)
+        val = float(price)
+        self._official_twap_history.append((ots, val))
+        if ots >= self.state.official_twap_ts:
+            self.state.official_twap_60s = val
+            self.state.official_twap_ts = ots
+            self.state.official_twap_recv_ts = time.time()
+            self.state.official_twap_source = source
+            self.state.twap_60s = val
+
+    def get_twap_at_or_after_utc(self, window_ts: float, max_after_sec: float = 5.0) -> Optional[float]:
+        """Return the earliest official Chainlink 60s TWAP tick at or after `window_ts` within `max_after_sec`."""
+        upper = window_ts + max(0.0, float(max_after_sec))
+        best_ots: Optional[float] = None
+        best_p: Optional[float] = None
+        for ots, p in self._official_twap_history:
+            if window_ts <= ots <= upper:
+                if best_ots is None or ots < best_ots:
+                    best_ots = ots
+                    best_p = p
+        return best_p
+
     def on_chainlink_tick(
         self,
         price: float,
@@ -310,6 +399,7 @@ class ChainlinkOracleFeed:
         if self.state.oracle_ts > 0 and eff_oracle_ts < self.state.oracle_ts - 10.0:
             return
 
+        is_monotonic_spot = eff_oracle_ts >= self.state.oracle_ts
         self.state.price = price
         self.state.source = source
         self.state.oracle_ts = max(self.state.oracle_ts, eff_oracle_ts)
@@ -318,17 +408,34 @@ class ChainlinkOracleFeed:
             self.state.round_id = round_id
 
         self._utc_history.append((eff_oracle_ts, price))
+        if self.on_price_callback is not None and is_monotonic_spot:
+            try:
+                self.on_price_callback(eff_oracle_ts, price)
+            except Exception as exc:
+                sys.stderr.write(f"[ORACLE VOL WARN] {exc}\n")
         self._twap_samples.append((now, price))
         cutoff = now - 60.0
         while len(self._twap_samples) > 2 and self._twap_samples[0][0] < cutoff:
             self._twap_samples.popleft()
 
+        has_fresh_official = (
+            self.state.official_twap_60s is not None
+            and self.state.official_twap_recv_ts > 0.0
+            and (now - self.state.official_twap_recv_ts) < 10.0
+        )
         if explicit_twap_60s is not None:
             self.state.twap_60s = explicit_twap_60s
+        elif has_fresh_official:
+            self.state.twap_60s = self.state.official_twap_60s
         else:
             self.state.twap_60s = self._compute_local_twap(now)
         if self.state.twap_60s and self.state.twap_60s > 0:
             self._utc_twap_history.append((eff_oracle_ts, float(self.state.twap_60s)))
+        if self.on_tick_callback is not None:
+            try:
+                self.on_tick_callback()
+            except Exception as exc:
+                sys.stderr.write(f"[ORACLE WAKE WARN] {exc}\n")
 
     def _compute_local_twap(self, now: float) -> float:
         pts = list(self._twap_samples)
@@ -435,6 +542,86 @@ class ChainlinkOracleFeed:
             except Exception:
                 await asyncio.sleep(2.5)
 
+    def _ingest_spot_snapshot(
+        self,
+        items: list[Any],
+        source: str,
+        normalizer: Callable[[Any], Optional[float]],
+    ) -> bool:
+        """Chronologically replay streaming Chainlink spot snapshots for 1s volatility warmup."""
+        parsed: list[Tuple[float, float]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            p_item = normalizer(item.get("value") or item.get("price"))
+            ots_item = _parse_ts_sec(item.get("timestamp"))
+            if p_item is not None and p_item > 0.0 and ots_item is not None and ots_item > 0.0:
+                parsed.append((ots_item, p_item))
+        if not parsed:
+            return False
+        parsed.sort(key=lambda pair: pair[0])
+        for ots_item, p_item in parsed[:-1]:
+            self._utc_history.append((ots_item, p_item))
+            if self.on_price_callback is not None and ots_item >= self.state.oracle_ts:
+                try:
+                    self.on_price_callback(ots_item, p_item)
+                except Exception as exc:
+                    sys.stderr.write(f"[ORACLE VOL WARN] {exc}\n")
+        last_ots, last_px = parsed[-1]
+        self.on_chainlink_tick(last_px, source, oracle_ts=last_ots)
+        return True
+
+    def _handle_polybolt_message(self, msg: dict[str, Any]) -> None:
+        """Decode PolyBolt spot or official 60s TWAP snapshots and ticks."""
+        ch = msg.get("channel", "")
+        data = msg.get("payload") or msg.get("data") or {}
+        if not isinstance(data, dict):
+            return
+        if isinstance(data.get("data"), list):
+            if ch == "price.crypto.twap":
+                for item in data["data"]:
+                    if not isinstance(item, dict):
+                        continue
+                    p_item = normalize_btc_usd_price(item.get("value") or item.get("price"))
+                    ots_item = _parse_ts_sec(item.get("timestamp"))
+                    if p_item is not None and ots_item is not None:
+                        self.on_official_twap_tick(p_item, ots_item, "POLYBOLT_TWAP60")
+                return
+            if ch == "price.crypto" and data["data"]:
+                self._ingest_spot_snapshot(data["data"], "POLYBOLT_CHAINLINK", normalize_btc_usd_price)
+            return
+        norm_p = normalize_btc_usd_price(data.get("price") or data.get("value"))
+        if norm_p is None:
+            return
+        ots = _parse_ts_sec(data.get("timestamp") or msg.get("ts"))
+        if ch == "price.crypto.twap":
+            self.on_official_twap_tick(norm_p, ots if ots is not None else self.utc_now(), "POLYBOLT_TWAP60")
+        elif ch in ("price.crypto", ""):
+            self.on_chainlink_tick(norm_p, "POLYBOLT_CHAINLINK", oracle_ts=ots)
+
+    def _handle_rtds_twap_payload(self, payload: dict[str, Any]) -> bool:
+        """Decode RTDS `crypto_prices_twap_sixty` snapshots and ticks; return True when valid."""
+        sym = str(payload.get("symbol", "")).lower().replace("-", "/")
+        if sym and "btc" not in sym:
+            return False
+        if isinstance(payload.get("data"), list):
+            any_tick = False
+            for item in payload["data"]:
+                if not isinstance(item, dict):
+                    continue
+                tw_p = normalize_btc_usd_price(item.get("value") or item.get("price"))
+                tw_ots = _parse_ts_sec(item.get("timestamp"))
+                if tw_p is not None and tw_ots is not None:
+                    self.on_official_twap_tick(tw_p, tw_ots, "RTDS_TWAP60")
+                    any_tick = True
+            return any_tick
+        tw_p = normalize_btc_usd_price(payload.get("value") or payload.get("price"))
+        if tw_p is None:
+            return False
+        tw_ots = _parse_ts_sec(payload.get("timestamp")) or self.utc_now()
+        self.on_official_twap_tick(tw_p, tw_ots, "RTDS_TWAP60")
+        return True
+
     async def _polybolt_v2_ws_loop(self, api_key: str, secret: str, passphrase: str) -> None:
         import websockets
 
@@ -469,17 +656,7 @@ class ChainlinkOracleFeed:
                     )
                     while not self._stop_event.is_set():
                         raw = await asyncio.wait_for(ws.recv(), timeout=12.0)
-                        msg = json.loads(raw)
-                        ch = msg.get("channel", "")
-                        data = msg.get("data") or msg.get("payload") or {}
-                        norm_p = normalize_btc_usd_price(data.get("price") or data.get("value"))
-                        if norm_p is None:
-                            continue
-                        if ch == "price.crypto.twap":
-                            self.state.twap_60s = norm_p
-                            self._utc_twap_history.append((self.utc_now(), norm_p))
-                        else:
-                            self.on_chainlink_tick(norm_p, "POLYBOLT_CHAINLINK")
+                        self._handle_polybolt_message(json.loads(raw))
                 if not self._stop_event.is_set():
                     self.polybolt_reconnects += 1
                     await asyncio.sleep(1.5)
@@ -494,14 +671,16 @@ class ChainlinkOracleFeed:
         if slot > 0:
             await asyncio.sleep(1.5 * slot)
 
-        # Subscribe strictly to BTC/USD via compact JSON filter (wildcards pull 8+ coins wastefully)
+        # Subscribe strictly to BTC/USD Chainlink Spot + official 60s TWAP streams
         sub_msg = {
             "action": "subscribe",
             "subscriptions": [
                 {"topic": "crypto_prices_chainlink", "type": "*", "filters": '{"symbol":"btc/usd"}'},
+                {"topic": "crypto_prices_twap_sixty", "type": "*", "filters": '{"symbol":"btc/usd"}'},
             ],
         }
 
+        rtds_consec_fails = 0
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(
@@ -519,7 +698,7 @@ class ChainlinkOracleFeed:
                     while not self._stop_event.is_set():
                         now_loop = time.time()
                         # Break out of silent/zombie sessions (e.g. RTDS drops topic push while still replying PONG)
-                        if now_loop - last_btc_tick_ts >= 3.5:
+                        if now_loop - last_btc_tick_ts >= self._rtds_zombie_timeout_sec(now_loop):
                             break
                         if now_loop - last_btc_tick_ts >= 2.0 and now_loop - last_resub_ts >= 2.0:
                             await ws.send(json.dumps(sub_msg))
@@ -535,7 +714,12 @@ class ChainlinkOracleFeed:
                         if raw in ("PONG", "pong", ""):
                             continue
                         msg = json.loads(raw)
-                        if msg.get("topic") != "crypto_prices_chainlink":
+                        topic = msg.get("topic")
+                        if topic == "crypto_prices_twap_sixty":
+                            if self._handle_rtds_twap_payload(msg.get("payload") or {}):
+                                rtds_consec_fails = 0
+                            continue
+                        if topic != "crypto_prices_chainlink":
                             continue
                         payload = msg.get("payload") or {}
                         sym = str(payload.get("symbol", "")).lower().replace("-", "/")
@@ -543,10 +727,18 @@ class ChainlinkOracleFeed:
                             continue
 
                         last_btc_tick_ts = time.time()
+                        rtds_consec_fails = 0
                         if (
                             self.state.source in ("CHAINLINK_DATA_STREAMS", "POLYBOLT_CHAINLINK")
                             and (time.time() - self.state.local_recv_ts) < 2.0
                         ):
+                            continue
+
+                        if isinstance(payload.get("data"), list):
+                            if self._ingest_spot_snapshot(
+                                payload["data"], "POLY_RTDS_CHAINLINK", normalize_btc_usd_price
+                            ):
+                                last_btc_tick_ts = time.time()
                             continue
 
                         price = normalize_btc_usd_price(payload.get("value") or payload.get("price"))
@@ -565,11 +757,23 @@ class ChainlinkOracleFeed:
                             )
                 if not self._stop_event.is_set():
                     self.rtds_reconnects += 1
-                    await asyncio.sleep(1.0)
+                    rtds_consec_fails += 1
+                    await asyncio.sleep(
+                        self._rtds_reconnect_delay_sec(
+                            rtds_consec_fails,
+                            self._is_primary_streaming_healthy(time.time()),
+                        )
+                    )
             except Exception:
                 if not self._stop_event.is_set():
                     self.rtds_reconnects += 1
-                await asyncio.sleep(1.5)
+                    rtds_consec_fails += 1
+                    await asyncio.sleep(
+                        self._rtds_reconnect_delay_sec(
+                            rtds_consec_fails,
+                            self._is_primary_streaming_healthy(time.time()),
+                        )
+                    )
 
     async def _onchain_round_robin_loop(self) -> None:
         """

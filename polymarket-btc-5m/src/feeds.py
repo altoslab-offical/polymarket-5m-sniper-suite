@@ -31,6 +31,7 @@ CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 POLY_CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 BINANCE_WS_URL = "wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker"
 BINANCE_REST_BOOK_URL = "https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol=BTCUSDT"
+BINANCE_REST_KLINES_URL = "https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1s"
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 COINBASE_REST_TICKER_URL = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 
@@ -366,10 +367,32 @@ class LiveFeedState:
     _down_book_initialized: bool = False
     _window_is_rollover: bool = False
     _window_first_book_recorded: bool = False
+    _twap240_sum: float = 0.0
+    _twap240_count: int = 0
+    _twap240_last_sec: int = -1
 
     def __post_init__(self) -> None:
         if self.book is None:
             self.book = OrderBookTop()
+
+    def record_twap240_spot(self, now_utc: float, cl_spot: Optional[float]) -> None:
+        """Record 1Hz Chainlink spot samples during the final 60s TWAP settling window."""
+        if cl_spot is None or cl_spot <= 0.0 or self.current_window_ts <= 0:
+            return
+        if (now_utc - self.current_window_ts) < 240.0:
+            return
+        sec_bucket = int(now_utc)
+        if sec_bucket != self._twap240_last_sec:
+            self._twap240_sum += float(cl_spot)
+            self._twap240_count += 1
+            self._twap240_last_sec = sec_bucket
+
+    @property
+    def realized_twap240(self) -> Tuple[Optional[float], float]:
+        """Return (realized_mean, elapsed_samples) collected in `[window_ts + 240, now]`."""
+        if self._twap240_count <= 0:
+            return None, 0.0
+        return self._twap240_sum / self._twap240_count, float(self._twap240_count)
 
     def calibrate_strike_from_opening_book(
         self,
@@ -383,7 +406,7 @@ class LiveFeedState:
         market makers' true Strike. Calibrates `strike_price` when >=3 early samples show a >=$12 gap.
         """
         if (
-            self.strike_source == "GAMMA_OFFICIAL"
+            self.strike_source in ("GAMMA_OFFICIAL", "OFFICIAL_TWAP60")
             or cl_spot is None
             or self.strike_price is None
             or not (1.5 <= elapsed_sec <= 45.0)
@@ -455,14 +478,16 @@ class LiveMarketHub:
     def __init__(self, tracker: RollingMicrostructureTracker, target_usdc: float = 25.0):
         self.tracker = tracker
         self.target_usdc = max(5.0, target_usdc) if target_usdc > 0 else 25.0
-        self.chainlink = ChainlinkOracleFeed()
+        self._wake_event = asyncio.Event()
+        self._last_eval_ts: float = 0.0
+        self.chainlink = ChainlinkOracleFeed(on_tick_callback=self.notify_wake)
         self.state = LiveFeedState()
         self.health = FeedHealthStats()
         self._stop_event = asyncio.Event()
         self._http = requests.Session()
         self._http.headers.update(
             {
-                "User-Agent": "polymarket-5m-sniper/4.5",
+                "User-Agent": "polymarket-5m-sniper/4.6",
                 "Accept": "application/json",
             }
         )
@@ -470,6 +495,34 @@ class LiveMarketHub:
         self._last_gamma_fetch_ts: float = 0.0
         self._gamma_strike_checks: int = 0
         self._last_clock_sync_ts: float = 0.0
+
+    def notify_wake(self) -> None:
+        """Wake the monitor loop immediately on a fresh streaming oracle or orderbook tick."""
+        self._wake_event.set()
+
+    async def wait_next_tick(self, timeout_sec: float, min_interval_sec: float = 0.025) -> bool:
+        """Wait for the next feed wakeup or `timeout_sec`, throttled by `min_interval_sec`."""
+        slept_min = 0.0
+        if min_interval_sec > 0.0 and self._last_eval_ts > 0.0:
+            rem_min = min_interval_sec - (time.monotonic() - self._last_eval_ts)
+            if rem_min > 0.0:
+                slept_min = min(rem_min, max(0.0, float(timeout_sec)))
+                await asyncio.sleep(slept_min)
+
+        if self._wake_event.is_set():
+            self._wake_event.clear()
+            self._last_eval_ts = time.monotonic()
+            return True
+
+        rem_timeout = max(0.005, float(timeout_sec) - slept_min)
+        try:
+            await asyncio.wait_for(self._wake_event.wait(), timeout=rem_timeout)
+            self._wake_event.clear()
+            self._last_eval_ts = time.monotonic()
+            return True
+        except asyncio.TimeoutError:
+            self._last_eval_ts = time.monotonic()
+            return False
 
     def utc_now(self) -> float:
         """Authoritative server-aligned UTC timestamp (immune to local Windows clock drift)."""
@@ -492,6 +545,17 @@ class LiveMarketHub:
         """
         window_ts = (int(now_utc) // 300) * 300
         if window_ts == self.state.current_window_ts:
+            if (
+                self.state.strike_source not in ("GAMMA_OFFICIAL", "OFFICIAL_TWAP60")
+                and (now_utc - window_ts) <= 20.0
+            ):
+                twap_s0 = self.chainlink.get_twap_at_or_after_utc(float(window_ts), max_after_sec=5.0)
+                if twap_s0 is not None:
+                    self.state.strike_price = twap_s0
+                    self.state._initial_cl_strike = twap_s0
+                    self.state.strike_source = "OFFICIAL_TWAP60"
+                    self.state._implied_strike_samples.clear()
+                    return
             # Backfill exact UTC boundary price if Chainlink tick arrived a moment after rollover
             if self.state.strike_price is None:
                 near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
@@ -523,6 +587,9 @@ class LiveMarketHub:
         self.state._window_is_rollover = had_prev
         self.state._window_first_book_recorded = False
         self.state._implied_strike_samples.clear()
+        self.state._twap240_sum = 0.0
+        self.state._twap240_count = 0
+        self.state._twap240_last_sec = -1
         self._gamma_strike_checks = 0
 
         if window_ts in self._prefetched_tokens:
@@ -531,18 +598,62 @@ class LiveMarketHub:
             self.state.up_token = None
             self.state.down_token = None
 
-        near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
-        cl_price = near_p or self.chainlink.state.settlement_reference_price
-        if (now_utc - window_ts) < 4.5 and cl_price is not None:
-            self.state.strike_price = cl_price
-            self.state._initial_cl_strike = cl_price
-            self.state.strike_source = self.chainlink.state.source
+        twap_s0 = self.chainlink.get_twap_at_or_after_utc(float(window_ts), max_after_sec=5.0)
+        if twap_s0 is not None:
+            self.state.strike_price = twap_s0
+            self.state._initial_cl_strike = twap_s0
+            self.state.strike_source = "OFFICIAL_TWAP60"
         else:
-            self.state.strike_price = None
-            self.state._initial_cl_strike = None
-            self.state.strike_source = "WAITING_GAMMA_OR_NEXT_WINDOW"
+            near_p = self.chainlink.get_price_near_utc(float(window_ts), max_diff_sec=5.0)
+            cl_price = near_p or self.chainlink.state.settlement_reference_price
+            if (now_utc - window_ts) < 4.5 and cl_price is not None:
+                self.state.strike_price = cl_price
+                self.state._initial_cl_strike = cl_price
+                self.state.strike_source = self.chainlink.state.source
+            else:
+                self.state.strike_price = None
+                self.state._initial_cl_strike = None
+                self.state.strike_source = "WAITING_GAMMA_OR_NEXT_WINDOW"
+
+    def _warmup_binance_1s_vol_once(self) -> int:
+        """Fetch up to 1,850 historical Binance 1s closes via REST for 30m vol_1s parity on boot."""
+        rows: List[Tuple[int, float]] = []
+        try:
+            r1 = self._http.get(f"{BINANCE_REST_KLINES_URL}&limit=1000", timeout=3.0)
+            c1 = r1.json() if r1.status_code == 200 else []
+            if isinstance(c1, list) and c1:
+                first_ms = int(c1[0][0])
+                for item in c1:
+                    if isinstance(item, list) and len(item) >= 5:
+                        rows.append((int(item[0]), float(item[4])))
+                try:
+                    r2 = self._http.get(
+                        f"{BINANCE_REST_KLINES_URL}&endTime={first_ms - 1}&limit=850",
+                        timeout=3.0,
+                    )
+                    c2 = r2.json() if r2.status_code == 200 else []
+                    if isinstance(c2, list):
+                        for item in c2:
+                            if isinstance(item, list) and len(item) >= 5:
+                                rows.append((int(item[0]), float(item[4])))
+                except Exception:
+                    pass
+        except Exception:
+            return 0
+        rows.sort(key=lambda pair: pair[0])
+        seen_ms = -1
+        loaded = 0
+        for open_ms, close_px in rows:
+            if open_ms <= seen_ms or open_ms <= 0 or close_px <= 0.0:
+                continue
+            seen_ms = open_ms
+            self.tracker.on_price(open_ms / 1000.0, close_px)
+            loaded += 1
+        return loaded
 
     async def start(self) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._warmup_binance_1s_vol_once)
         tasks = [
             self.chainlink.start(),
             self._cex_http_fallback_loop(),
@@ -596,6 +707,7 @@ class LiveMarketHub:
         if via_ws:
             self.state.last_ws_book_local_ts = local_ts
             self.state.last_book_update_local_ts = local_ts
+            self.notify_wake()
         elif bid is not None or ask is not None:
             self.state.last_book_update_local_ts = local_ts
 
@@ -732,6 +844,7 @@ class LiveMarketHub:
                         self.state.binance_ts = time.time()
                         self.state.update_usdt_basis()
                         self.tracker.on_book_ticker(bq, aq)
+                        self.tracker.on_price(self.utc_now(), self.state.binance_price)
             except Exception:
                 pass
 
@@ -748,10 +861,7 @@ class LiveMarketHub:
             except Exception:
                 pass
 
-        # Feed fast 1s USD-equivalent price series into volatility estimator
-        vol_price = self.state.cex_lead_price or self.chainlink.state.settlement_reference_price
-        if vol_price is not None:
-            self.tracker.on_price(self.utc_now(), vol_price)
+        # Realized vol_1s is driven solely by single-venue Binance 1s closes (REST warmup + aggTrade/bookTicker).
 
     async def _cex_http_fallback_loop(self) -> None:
         loop = asyncio.get_running_loop()
@@ -794,7 +904,7 @@ class LiveMarketHub:
                             self.state.binance_ts = now_local
                             self.state.update_usdt_basis()
                             self.tracker.on_trade(now_utc, p, q, is_buyer_maker)
-                            self.tracker.on_price(now_utc, self.state.cex_lead_price or p)
+                            self.tracker.on_price(now_utc, p)
                         elif "bookTicker" in stream:
                             bid_p, ask_p = float(data["b"]), float(data["a"])
                             bid_q, ask_q = float(data["B"]), float(data["A"])
@@ -802,6 +912,7 @@ class LiveMarketHub:
                             self.state.binance_ts = now_local
                             self.state.update_usdt_basis()
                             self.tracker.on_book_ticker(bid_q, ask_q)
+                            self.tracker.on_price(now_utc, self.state.binance_price)
             except Exception:
                 if not self._stop_event.is_set():
                     self.health.binance_ws_reconnects += 1

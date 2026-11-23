@@ -8,7 +8,7 @@ from dataclasses import dataclass
 class StrategyConfig:
     # --- Polymarket Window & Fee Mechanics ---
     window_seconds: int = 300               # 5-minute candles (288 windows/day)
-    crypto_taker_fee_rate: float = 0.07     # Fee = C * 0.07 * p * (1 - p)
+    crypto_taker_fee_rate: float = 0.01     # Fee = C * 0.01 * p * (1 - p) [Polymarket crypto_fees_v2]
     maker_rebate_share: float = 0.20        # 20% of taker fee pool redistributed to makers
 
     # --- Entry Window (Calibrated on 400+ live Polymarket 5m windows) ---
@@ -17,23 +17,28 @@ class StrategyConfig:
     entry_end_elapsed_sec: float = 255.0    # Stop new entries at 4m15s elapsed (45s left)
 
     # --- High-Probability Spatial Cushion & Pricing Filters ---
-    min_z_score: float = 1.30               # |Delta S| / (sigma * sqrt(tau)) >= 1.30
+    min_z_score: float = 1.30               # E4 dual-consensus |Z_CL| & |Z_BN| >= 1.30 (aligned w/ Phase 4.2 frozen_config)
     min_true_prob: float = 0.80             # Model fat-tail win prob must be >= 80%
     min_entry_price: float = 0.68           # Avoid low-conviction chop
     max_entry_price: float = 0.82           # Cap <= $0.82 (~$0.83 w/ fee) to prevent 6.5:1 adverse payoff skew
     max_entry_spread: float = 0.06          # Reject entry if CLOB bid-ask spread > 6c (illiquid/vacuum book)
     min_net_edge: float = 0.035             # P_true - (Ask + TakerFee) >= 3.5%
-    max_model_market_divergence: float = 0.15  # Reject entry if P_true - Ask > 15% (uncalibrated strike mirage guard)
+    max_model_market_divergence: float = 0.25  # Reject entry if P_true - Ask > 25% (aligned with OFFICIAL_TWAP60)
 
     # --- Strike (Price-to-Beat) Uncertainty Guard [2026-11-18 consensus] ---
     # 跨盤實證: BOOK_CALIBRATED 在 ETH 與官方結算一致率為 92.6% (高於未校正 t=0 的 86.3%)，
     # 保留盤口基準價校正並關閉整盤封鎖 (搭配 0.000070 波動率地板過濾假突破)。
-    skip_book_calibrated_windows: bool = False
+    skip_book_calibrated_windows: bool = True
+    require_official_oracle_strike: bool = True  # v5.1: Enforce OFFICIAL_TWAP60 / GAMMA_OFFICIAL strike only
 
     # --- Heavy-Tail / Volatility Calibration ---
     student_t_df: float = 4.5               # Degrees of freedom for ETH 5m fat-tail jumps
-    vol_lookback_sec: int = 180             # 3-minute rolling 1s realized volatility window
-    min_1s_vol_floor: float = 0.000070      # ~75% of ETH median 1s vol (0.000094), prevents dead-market fake Z>=1.30 traps
+    vol_lookback_sec: int = 1800            # 30-minute rolling 1s Binance close realized vol (Phase 4.2 parity)
+    min_1s_vol_floor: float = 0.000035      # Phase 4.2 v2_filtered vol floor
+    use_twap_projection: bool = True        # Exact 60s TWAP variance-reduction & final-60s integral
+    twap_gaussian_weight: float = 0.70      # Blend weight on Gaussian CDF in TWAP projection
+    twap_student_t_df: float = 6.0          # Student-t tail df for TWAP projection
+    e4_dual_consensus: bool = True          # Phase 4.2 E4: min(|z_CL|, |z_BN_adj|) >= min_z_score
 
     # --- CEX Orderflow & Chainlink Oracle-Gap Confirmation ---
     cvd_window_sec: int = 20                # 20-second Cumulative Volume Delta lookback

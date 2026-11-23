@@ -115,6 +115,9 @@ class SharedDailyRiskGuard:
         eq = max(0.0, float(equity))
         cap = max(self.min_loss_cap_usd, round(eq * self.max_daily_loss_pct, 2))
         prev = prev_state or {}
+        slots = prev.get("active_window_slots")
+        dedupe = self._prune_ts_map(prev.get("alert_dedupe"), ts - 86400.0)
+        active = self._prune_ts_map(prev.get("alert_active"), ts - 86400.0)
         return {
             "day_utc": cur_day,
             "day_start_equity": round(eq, 4),
@@ -124,6 +127,9 @@ class SharedDailyRiskGuard:
             "cached_balance_usdc": float(prev.get("cached_balance_usdc") or 0.0),
             "cached_balance_ts": float(prev.get("cached_balance_ts") or 0.0),
             "pending_spend_usdc": float(prev.get("pending_spend_usdc") or 0.0),
+            "active_window_slots": dict(slots) if isinstance(slots, dict) else {},
+            "alert_dedupe": dedupe,
+            "alert_active": active,
             "last_updated_ts": ts,
         }
 
@@ -231,3 +237,129 @@ class SharedDailyRiskGuard:
                 float(state.get("daily_realized_pnl_usdc") or 0.0),
                 float(state.get("max_daily_loss_usdc") or self.min_loss_cap_usd),
             )
+
+    @staticmethod
+    def _prune_ts_map(raw: Any, cutoff: float) -> dict[str, float]:
+        """Keep valid numeric timestamps at or above `cutoff`."""
+        cleaned: dict[str, float] = {}
+        if not isinstance(raw, dict):
+            return cleaned
+        for k, val in raw.items():
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                continue
+            if num >= cutoff:
+                cleaned[str(k)] = num
+        return cleaned
+
+    def claim_alert(
+        self,
+        key: str,
+        cooldown_sec: float = 1800.0,
+        mark_active: bool = False,
+        now_ts: float | None = None,
+    ) -> bool:
+        """Atomically claim a cross-process alert slot honoring `cooldown_sec`."""
+        norm_key = str(key).strip().lower()
+        if not norm_key:
+            return False
+        ts = time.time() if now_ts is None else float(now_ts)
+        cur_day = int(ts // 86400)
+        cd = max(0.0, float(cooldown_sec))
+        with self._state_lock():
+            state = self._read_state_unlocked()
+            if not state:
+                state = self._build_new_day_state(cur_day, 0.0, ts)
+            dedupe = self._prune_ts_map(state.get("alert_dedupe"), ts - 86400.0)
+            prev = dedupe.get(norm_key, 0.0)
+            if prev > 0.0 and (ts - prev) < cd:
+                return False
+            dedupe[norm_key] = ts
+            state["alert_dedupe"] = dedupe
+            if mark_active:
+                active = self._prune_ts_map(state.get("alert_active"), ts - 86400.0)
+                active[norm_key] = ts
+                state["alert_active"] = active
+            state["last_updated_ts"] = ts
+            self._write_state_unlocked(state)
+            return True
+
+    def resolve_alert(self, key: str, now_ts: float | None = None) -> float | None:
+        """Clear an active cross-process alert and return outage duration in seconds."""
+        norm_key = str(key).strip().lower()
+        if not norm_key:
+            return None
+        ts = time.time() if now_ts is None else float(now_ts)
+        with self._state_lock():
+            state = self._read_state_unlocked()
+            active = state.get("alert_active")
+            if not isinstance(active, dict) or norm_key not in active:
+                return None
+            started_raw = active.pop(norm_key, None)
+            state["alert_active"] = active
+            state["last_updated_ts"] = ts
+            self._write_state_unlocked(state)
+        try:
+            started_ts = float(started_raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return round(max(0.0, ts - started_ts), 1)
+
+    @staticmethod
+    def _prune_window_slots(raw_slots: Any, cutoff: int) -> dict[str, list[str]]:
+        active: dict[str, list[str]] = {}
+        if not isinstance(raw_slots, dict):
+            return active
+        for k, vals in raw_slots.items():
+            try:
+                if int(k) >= cutoff and isinstance(vals, list):
+                    active[str(k)] = [str(v).upper() for v in vals]
+            except (TypeError, ValueError):
+                continue
+        return active
+
+    def try_acquire_window_slot(self, window_ts: int, coin: str, max_coins: int = 1) -> bool:
+        """Atomically acquire a correlated 5m window slot up to `max_coins` simultaneous coins."""
+        win_i = int(window_ts)
+        win_key = str(win_i)
+        coin_key = str(coin).strip().upper()
+        cap = max(1, int(max_coins))
+        cutoff = win_i - 600
+        with self._state_lock():
+            state = self._read_state_unlocked()
+            active = self._prune_window_slots(state.get("active_window_slots"), cutoff)
+            slots = list(active.get(win_key, []))
+            if coin_key in slots:
+                state["active_window_slots"] = active
+                self._write_state_unlocked(state)
+                return True
+            if len(slots) >= cap:
+                state["active_window_slots"] = active
+                self._write_state_unlocked(state)
+                return False
+            slots.append(coin_key)
+            active[win_key] = slots
+            state["active_window_slots"] = active
+            self._write_state_unlocked(state)
+            return True
+
+    def release_window_slot(self, window_ts: int, coin: str) -> None:
+        """Release a reserved 5m window slot after an unfilled entry or completed cycle."""
+        win_key = str(int(window_ts))
+        coin_key = str(coin).strip().upper()
+        with self._state_lock():
+            state = self._read_state_unlocked()
+            raw_slots = state.get("active_window_slots")
+            if not isinstance(raw_slots, dict) or win_key not in raw_slots:
+                return
+            vals = raw_slots.get(win_key)
+            if not isinstance(vals, list):
+                return
+            updated = [str(v).upper() for v in vals if str(v).upper() != coin_key]
+            if updated:
+                raw_slots[win_key] = updated
+            else:
+                raw_slots.pop(win_key, None)
+            state["active_window_slots"] = raw_slots
+            self._write_state_unlocked(state)

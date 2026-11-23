@@ -91,6 +91,7 @@ class HighProbSniperStrategy:
         elapsed_sec: float,
         fv: FairValueEstimate,
         book: OrderBookTop,
+        strike_source: str = "OFFICIAL_TWAP60",
     ) -> Optional[str]:
         """
         Process a real-time or backtest tick. Returns a human-readable action string if an entry/exit occurs.
@@ -101,6 +102,10 @@ class HighProbSniperStrategy:
 
         # 2. Only 1 sniper shot allowed per 5-minute window
         if window_ts in self.traded_windows:
+            return None
+
+        # 2b. Strict Polymarket Official Oracle Strike Guard (Chainlink TWAP-60s / Gamma Official only)
+        if self.cfg.require_official_oracle_strike and strike_source not in ("OFFICIAL_TWAP60", "GAMMA_OFFICIAL"):
             return None
 
         # 3. Enforce strict late-window timing filter
@@ -128,6 +133,20 @@ class HighProbSniperStrategy:
             ask_price = book.down_ask
         else:
             return None
+
+        # 4b. Claude Phase 4.2 E4 Dual-Consensus Guard:
+        # Both Chainlink TWAP and basis-adjusted Binance TWAP must confirm |Z| >= min_z_score.
+        if self.cfg.e4_dual_consensus:
+            if fv.bn_raw_z is None:
+                return None
+            sign = 1.0 if candidate_side == "UP" else -1.0
+            if sign * fv.bn_raw_z < self.cfg.min_z_score:
+                return None
+            p_bn = fv.bn_p_true_up if candidate_side == "UP" else fv.bn_p_true_down
+            if p_bn is None:
+                return None
+            dir_z = min(dir_z, abs(fv.bn_raw_z))
+            p_true = min(p_true, p_bn)
 
         # 5. Chainlink Oracle-Gap & CEX Orderflow Confirmation:
         # Reject if CEX has already dumped against Chainlink's lead or if un-spoofable market CVD opposes trade

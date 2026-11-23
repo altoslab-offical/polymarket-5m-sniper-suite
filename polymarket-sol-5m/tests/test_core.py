@@ -26,6 +26,7 @@ from src.pricing_model import (
     student_t_cdf,
 )
 from src.storage import MarketDataStorage
+from src.config import StrategyConfig
 from src.strategy import HighProbSniperStrategy, OrderBookTop
 
 
@@ -109,7 +110,7 @@ class TestPolymarketChainlinkQuantCore(unittest.TestCase):
         Verify that if Chainlink is +1.6 Z above Strike, BUT CEX has flash-dumped -12 bps below
         Chainlink (Oracle Gap trap!), the strategy refuses to enter UP.
         """
-        strat = HighProbSniperStrategy()
+        strat = HighProbSniperStrategy(StrategyConfig(e4_dual_consensus=False))
         book = OrderBookTop(up_bid=0.76, up_ask=0.78, down_bid=0.20, down_ask=0.22)
 
         # Case 1: CEX flash-dumped to 94,980 while Chainlink is still lagging at 95,120 (-14.7 bps gap!)
@@ -222,11 +223,13 @@ class TestPolymarketChainlinkQuantCore(unittest.TestCase):
         self.assertAlmostEqual(both_lead, bn_only_lead, delta=1.0)
 
         # 4. EV-aware Take Profit holds $0.96 when P_true=99.4%, exits at $0.99
-        strat = HighProbSniperStrategy()
-        fv_entry = estimate_fair_value(95000.0, 95110.0, 90.0, 0.00009, 0.3, 95115.0)
+        strat = HighProbSniperStrategy(StrategyConfig(e4_dual_consensus=False))
+        fv_entry = estimate_fair_value(95000.0, 95140.0, 90.0, 0.00009, 0.3, 95145.0)
         assert fv_entry is not None
-        # Mirage guard blocks when P_true (~90.8%) - Ask (0.72) > 15%
-        mirage_res = strat.evaluate_tick(99.0, 0, 209.0, fv_entry, OrderBookTop(0.70, 0.72, 0.28, 0.30))
+        # Mirage guard blocks when P_true (~98.5%) - Ask (0.69) > 25%
+        fv_mirage = estimate_fair_value(95000.0, 95220.0, 60.0, 0.00009, 0.3, 95225.0)
+        assert fv_mirage is not None
+        mirage_res = strat.evaluate_tick(99.0, 0, 209.0, fv_mirage, OrderBookTop(0.67, 0.69, 0.31, 0.33))
         self.assertIsNone(mirage_res)
         # Normal entry succeeds when Ask=0.80 (divergence ~10.8% <= 15%)
         strat.evaluate_tick(100.0, 0, 210.0, fv_entry, OrderBookTop(0.78, 0.80, 0.20, 0.22))
@@ -258,7 +261,7 @@ class TestPolymarketChainlinkQuantCore(unittest.TestCase):
         self.assertFalse(fill_err.filled)
 
         # 6. Anti-OBI-spoofing CVD guard (blocks DOWN when real market CVD is positive buying)
-        strat2 = HighProbSniperStrategy()
+        strat2 = HighProbSniperStrategy(StrategyConfig(e4_dual_consensus=False))
         fv_spoof = estimate_fair_value(
             68104.34, 68050.0, 80.0, 0.000050, -0.09, 68048.0, cvd_imbalance=0.26
         )

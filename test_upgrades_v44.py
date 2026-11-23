@@ -174,8 +174,8 @@ def test_chainlink_rtds_and_run_monitor_v44_wiring(coin_dir: str, tick_var: str)
     assert "loop_sleep = 0.25 if hot_zone else 1.0" in mon_src
     assert "if is_1hz_tick:" in mon_src
     assert "[MONITOR LOOP WARN]" in mon_src
-    assert "for wait_s in (4.0, 4.0, 5.0):" in mon_src
-    assert "live_exec.keepalive_if_needed, 14.0" in mon_src
+    assert "for wait_s in (2.0, 3.0, 4.0, 5.0):" in mon_src
+    assert "live_exec.keepalive_if_needed, 10.0" in mon_src
 
     feeds_src = (FRIEND_ROOT / coin_dir / "src" / "feeds.py").read_text(encoding="utf-8")
-    assert "POLYBOLT_TWAP_T0" not in feeds_src
+    assert "OFFICIAL_TWAP60" in feeds_src and "get_twap_at_or_after_utc(" in feeds_src
